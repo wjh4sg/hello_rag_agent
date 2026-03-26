@@ -1,0 +1,16 @@
+.venv/
+venv/
+__pycache__/
+.pytest_cache/
+.idea/
+.trae/
+logs/
+chroma_db/
+memory/
+skills/
+tool-output/
+runtime/*.log
+*.pyc
+*.pyo
+*.pyd
+*.sqlite3

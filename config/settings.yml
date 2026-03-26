@@ -1,0 +1,25 @@
+agent:
+  name: hello-rag-agent
+  max_steps: 6
+  history_turns: 6
+
+knowledge_base:
+  data_dir: data
+  supported_extensions:
+    - .txt
+    - .md
+    - .pdf
+  chunk_size: 600
+  chunk_overlap: 120
+  top_k: 4
+  retrieval_mode: hybrid
+  vector_store_dir: data/chroma_db
+  collection_name: hello_rag_agent_kb
+  embedding_model: text-embedding-v4
+  embedding_dimensions: 1024
+
+llm:
+  model: tongyi-xiaomi-analysis-pro
+  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+  temperature: 0.0
+  max_tokens: 1200

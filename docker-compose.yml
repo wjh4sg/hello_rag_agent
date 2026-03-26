@@ -1,0 +1,51 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hello-rag-api
+    command:
+      - python
+      - -m
+      - uvicorn
+      - api.api_service:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    environment:
+      PYTHONUNBUFFERED: "1"
+      LLM_MODEL_ID: ${LLM_MODEL_ID:-tongyi-xiaomi-analysis-pro}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
+    ports:
+      - "18000:8000"
+    restart: unless-stopped
+
+  streamlit:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hello-rag-streamlit
+    command:
+      - python
+      - -m
+      - streamlit
+      - run
+      - app.py
+      - --server.address
+      - 0.0.0.0
+      - --server.port
+      - "8501"
+      - --server.headless
+      - "true"
+    environment:
+      PYTHONUNBUFFERED: "1"
+      LLM_MODEL_ID: ${LLM_MODEL_ID:-tongyi-xiaomi-analysis-pro}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://dashscope.aliyuncs.com/compatible-mode/v1}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
+    ports:
+      - "18501:8501"
+    restart: unless-stopped

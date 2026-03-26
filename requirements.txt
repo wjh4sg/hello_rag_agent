@@ -1,0 +1,8 @@
+hello-agents
+streamlit
+fastapi
+uvicorn
+pyyaml
+pypdf
+python-dotenv
+chromadb
