@@ -6,9 +6,13 @@ __pycache__/
 .trae/
 logs/
 chroma_db/
+data/chroma_db/
+data/memory.db
 memory/
 skills/
 tool-output/
+runtime/
+evaluation/results/
 runtime/*.log
 *.pyc
 *.pyo

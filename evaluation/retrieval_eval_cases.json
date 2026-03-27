@@ -1,0 +1,61 @@
+[
+  {
+    "id": "retrieval_overview_001",
+    "query": "这个知识库主要讲什么？",
+    "goal": "评估检索是否能拉回覆盖选购、维护和故障排查的总览证据。",
+    "expected_keywords": ["选购", "维护", "故障"],
+    "top_k": 4,
+    "strategy": "hybrid",
+    "min_keyword_hit_rate": 0.67
+  },
+  {
+    "id": "retrieval_selection_001",
+    "query": "扫地机器人适合大户型时，应该重点关注哪些参数？",
+    "goal": "评估检索能否命中大户型选购场景。",
+    "expected_sources": ["选购指南.txt", "扫地机器人100问2.txt"],
+    "expected_keywords": ["续航", "断点续扫", "水箱", "大户型"],
+    "top_k": 4,
+    "strategy": "hybrid",
+    "min_keyword_hit_rate": 0.5
+  },
+  {
+    "id": "retrieval_maintenance_001",
+    "query": "滚刷、边刷和滤网一般需要多久清理或更换一次？",
+    "goal": "评估检索能否命中耗材与维护周期信息。",
+    "expected_sources": ["维护保养.txt", "扫地机器人100问2.txt", "扫拖一体机器人100问.txt"],
+    "expected_keywords": ["滚刷", "边刷", "滤网", "更换"],
+    "top_k": 4,
+    "strategy": "hybrid",
+    "min_keyword_hit_rate": 0.75
+  },
+  {
+    "id": "retrieval_troubleshooting_001",
+    "query": "机器人无法回充时，一般应该怎么排查？",
+    "goal": "评估检索能否命中回充故障的核心排查证据。",
+    "expected_sources": ["扫地机器人100问2.txt", "故障排除.txt", "维护保养.txt"],
+    "expected_keywords": ["回充", "充电座", "传感器", "无遮挡"],
+    "top_k": 4,
+    "strategy": "hybrid",
+    "min_keyword_hit_rate": 0.5
+  },
+  {
+    "id": "retrieval_troubleshooting_002",
+    "query": "APP 连不上扫地机器人时，通常应该检查什么？",
+    "goal": "评估检索能否命中连接类故障证据。",
+    "expected_sources": ["扫地机器人100问2.txt", "故障排除.txt"],
+    "expected_keywords": ["APP", "2.4G", "WiFi", "路由器"],
+    "top_k": 4,
+    "strategy": "hybrid",
+    "min_keyword_hit_rate": 0.75
+  },
+  {
+    "id": "retrieval_troubleshooting_003",
+    "query": "扫拖一体机器人出水异常时，通常有哪些可能原因？",
+    "goal": "评估检索能否命中拖地出水异常场景的核心证据。",
+    "expected_sources": ["扫拖一体机器人100问.txt", "故障排除.txt", "维护保养.txt"],
+    "expected_keywords": ["水箱", "出水", "出水管", "堵塞"],
+    "top_k": 4,
+    "strategy": "hybrid",
+    "min_keyword_hit_rate": 0.75
+  }
+]

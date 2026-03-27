@@ -2,10 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-import math
-import re
 from typing import Any
-from uuid import uuid4
 
 from hello_agents.context import ContextPacket
 from hello_agents.core.message import Message
@@ -13,8 +10,12 @@ from hello_agents.tools.base import Tool, ToolParameter
 from hello_agents.tools.errors import ToolErrorCode
 from hello_agents.tools.response import ToolResponse
 
+from hello_rag_agent.config import load_settings
+from hello_rag_agent.memory_manager import MemoryManager
+from hello_rag_agent.memory_profile import format_profile_fact_line
+from hello_rag_agent.memory_store import MemoryRecord, SQLiteMemoryStore
 
-TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]")
+
 SUPPORTED_MEMORY_TYPES = {"working", "episodic", "semantic", "perceptual"}
 
 
@@ -30,13 +31,21 @@ class MemoryEntry:
 
 
 class MemoryTool(Tool):
-    """Session-scoped memory manager with minimal lifecycle actions."""
+    """Session-scoped memory tool backed by MemoryManager + SQLite store."""
 
     def __init__(
         self,
         session_id: str,
+        user_id: str | None = None,
         default_top_k: int = 3,
-        max_entries: int = 200,
+        max_entries: int | None = None,
+        *,
+        store: SQLiteMemoryStore | None = None,
+        manager: MemoryManager | None = None,
+        working_ttl_minutes: int | None = None,
+        profile_enabled: bool | None = None,
+        profile_max_facts: int | None = None,
+        assistant_memory_min_chars: int | None = None,
     ):
         super().__init__(
             name="memory_tool",
@@ -46,26 +55,28 @@ class MemoryTool(Tool):
                 "action=stats for diagnostics, and action=clear_all to reset memory."
             ),
         )
+        settings = load_settings().memory
         self.session_id = session_id
-        self.default_top_k = default_top_k
-        self.max_entries = max_entries
-        self._entries: list[MemoryEntry] = []
+        self.user_id = user_id or f"session:{session_id}"
+        self.default_top_k = default_top_k or settings.default_top_k
+        self.max_entries = max_entries or settings.working_max_entries
+        self.working_ttl_minutes = working_ttl_minutes or settings.working_ttl_minutes
+        self.profile_enabled = settings.profile_enabled if profile_enabled is None else profile_enabled
+        self.profile_max_facts = profile_max_facts or settings.profile_max_facts
+        self.assistant_memory_min_chars = assistant_memory_min_chars or settings.assistant_memory_min_chars
+        self.store = store or SQLiteMemoryStore(settings.db_path)
+        self.manager = manager or MemoryManager(
+            store=self.store,
+            default_top_k=self.default_top_k,
+            working_max_entries=self.max_entries,
+            working_ttl_minutes=self.working_ttl_minutes,
+            profile_enabled=self.profile_enabled,
+            profile_max_facts=self.profile_max_facts,
+            assistant_memory_min_chars=self.assistant_memory_min_chars,
+        )
 
     def remember_message(self, message: Message) -> None:
-        content = message.content.strip()
-        if not content:
-            return
-
-        memory_type = "episodic" if message.role == "assistant" else "working"
-        importance = 0.65 if message.role == "assistant" else 0.55
-        self.add(
-            content=content,
-            role=message.role,
-            memory_type=memory_type,
-            importance=importance,
-            metadata={"session_id": self.session_id, "source": "conversation"},
-            timestamp=message.timestamp,
-        )
+        self.manager.remember_message(user_id=self.user_id, session_id=self.session_id, message=message)
 
     def add(
         self,
@@ -81,26 +92,26 @@ class MemoryTool(Tool):
         if not normalized_content:
             raise ValueError("Memory content cannot be empty.")
 
-        normalized_type = self._normalize_memory_type(memory_type)
-        entry = MemoryEntry(
-            entry_id=uuid4().hex,
-            role=role,
+        record = self.manager.add_memory(
+            user_id=self.user_id,
+            session_id=self.session_id,
             content=normalized_content,
-            memory_type=normalized_type,
-            timestamp=timestamp or datetime.now(),
+            role=role,
+            memory_type=self._normalize_memory_type(memory_type),
             importance=self._clamp_importance(importance),
-            metadata=dict(metadata or {}),
+            metadata=self._build_metadata(metadata),
+            timestamp=timestamp,
         )
-        self._entries.append(entry)
-        if len(self._entries) > self.max_entries:
-            self._entries = self._entries[-self.max_entries :]
-        return entry
+        return self._record_to_entry(record)
 
     def clear(self) -> None:
         self.clear_all()
 
     def clear_all(self) -> None:
-        self._entries.clear()
+        self.manager.clear_all_for_user_session(user_id=self.user_id, session_id=self.session_id)
+
+    def clear_session_context(self) -> None:
+        self.manager.clear_session_context(self.session_id)
 
     def update_entry(
         self,
@@ -111,28 +122,22 @@ class MemoryTool(Tool):
         memory_type: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> MemoryEntry | None:
-        for index, entry in enumerate(self._entries):
-            if entry.entry_id != entry_id:
-                continue
-
-            updated = MemoryEntry(
-                entry_id=entry.entry_id,
-                role=entry.role,
-                content=content.strip() if isinstance(content, str) and content.strip() else entry.content,
-                memory_type=self._normalize_memory_type(memory_type or entry.memory_type),
-                timestamp=entry.timestamp,
-                importance=self._clamp_importance(importance if importance is not None else entry.importance),
-                metadata=dict(metadata) if metadata is not None else dict(entry.metadata),
-            )
-            self._entries[index] = updated
-            return updated
-        return None
+        updated = self.manager.update_memory(
+            entry_id,
+            content=content,
+            importance=self._clamp_importance(importance) if importance is not None else None,
+            memory_type=self._normalize_memory_type(memory_type) if memory_type else None,
+            metadata=metadata,
+        )
+        if updated is None:
+            return None
+        return self._record_to_entry(updated)
 
     def remove_entry(self, entry_id: str) -> MemoryEntry | None:
-        for index, entry in enumerate(self._entries):
-            if entry.entry_id == entry_id:
-                return self._entries.pop(index)
-        return None
+        removed = self.manager.remove_memory(entry_id)
+        if removed is None:
+            return None
+        return self._record_to_entry(removed)
 
     def search(
         self,
@@ -144,40 +149,79 @@ class MemoryTool(Tool):
         if not normalized_query:
             return []
 
-        query_tokens = self._tokenize(normalized_query)
-        if not query_tokens:
-            return []
+        normalized_types = [self._normalize_memory_type(item) for item in memory_types or []]
+        bundle = self.manager.search(
+            user_id=self.user_id,
+            session_id=self.session_id,
+            query=normalized_query,
+            top_k=top_k or self.default_top_k,
+            memory_types=normalized_types or None,
+        )
 
-        normalized_types = {self._normalize_memory_type(item) for item in memory_types or []}
-        scored: list[tuple[float, MemoryEntry]] = []
-        now = datetime.now()
+        combined: list[tuple[float, MemoryEntry]] = []
+        seen_contents: set[str] = set()
 
-        for entry in self._entries:
-            if normalized_types and entry.memory_type not in normalized_types:
+        for score, fact in bundle.fact_matches:
+            line = format_profile_fact_line(fact.fact_key, fact.fact_value)
+            if line in seen_contents:
                 continue
-
-            content_tokens = self._tokenize(entry.content)
-            if not content_tokens:
-                continue
-
-            overlap = sum(
-                min(query_tokens.count(token), content_tokens.count(token))
-                for token in set(query_tokens)
+            seen_contents.add(line)
+            combined.append(
+                (
+                    score,
+                    MemoryEntry(
+                        entry_id=fact.fact_id,
+                        role="profile",
+                        content=line,
+                        memory_type="semantic",
+                        timestamp=fact.updated_at,
+                        importance=fact.confidence,
+                        metadata={
+                            "fact_key": fact.fact_key,
+                            "fact_value": fact.fact_value,
+                            "source_entry_id": fact.source_entry_id,
+                            "source": "profile_fact",
+                            "user_id": fact.user_id,
+                            "session_id": fact.session_id,
+                        },
+                    ),
+                )
             )
-            if overlap == 0 and normalized_query not in entry.content:
+
+        for score, record in bundle.entry_matches:
+            entry = self._record_to_entry(record)
+            normalized_content = entry.content.strip()
+            if not normalized_content or normalized_content in seen_contents:
                 continue
+            seen_contents.add(normalized_content)
+            combined.append((score, entry))
 
-            age_seconds = max((now - entry.timestamp).total_seconds(), 0.0)
-            recency_bonus = math.exp(-age_seconds / 3600.0)
-            exact_bonus = 1.5 if normalized_query in entry.content else 0.0
-            role_bonus = 0.2 if entry.role == "assistant" else 0.0
-            type_bonus = 0.15 if entry.memory_type == "working" else 0.05
-            score = overlap * 2.0 + recency_bonus + exact_bonus + role_bonus + type_bonus + entry.importance
-            scored.append((score, entry))
+        combined.sort(key=lambda item: (item[0], item[1].timestamp), reverse=True)
+        return [entry for _, entry in combined[: top_k or self.default_top_k]]
 
-        scored.sort(key=lambda item: item[0], reverse=True)
-        limit = top_k or self.default_top_k
-        return [entry for _, entry in scored[:limit]]
+    def get_profile_lines(self, *, query: str | None = None, limit: int | None = None) -> list[str]:
+        return self.manager.get_profile_lines(
+            user_id=self.user_id,
+            query=query,
+            limit=limit or self.profile_max_facts,
+        )
+
+    def get_profile_history_lines(self, *, fact_key: str | None = None, limit: int | None = None) -> list[str]:
+        return self.manager.get_profile_history_lines(
+            user_id=self.user_id,
+            fact_key=fact_key,
+            limit=limit or self.profile_max_facts,
+        )
+
+    def build_profile_packet(self, *, query: str, top_k: int | None = None) -> ContextPacket | None:
+        lines = self.get_profile_lines(query=query, limit=top_k or min(self.default_top_k, self.profile_max_facts))
+        if not lines:
+            return None
+        content = "[User Profile]\n" + "\n".join(f"- {line}" for line in lines)
+        return ContextPacket(
+            content=content,
+            metadata={"type": "user_profile", "session_id": self.session_id, "user_id": self.user_id},
+        )
 
     def render_context(
         self,
@@ -209,42 +253,21 @@ class MemoryTool(Tool):
             return None
         return ContextPacket(
             content=context,
-            metadata={"type": "related_memory", "session_id": self.session_id},
+            metadata={"type": "related_memory", "session_id": self.session_id, "user_id": self.user_id},
         )
 
     def summary(self, limit: int = 5) -> dict[str, Any]:
-        recent_entries = self._entries[-limit:]
-        counts_by_type: dict[str, int] = {}
-        counts_by_role: dict[str, int] = {}
-        for entry in self._entries:
-            counts_by_type[entry.memory_type] = counts_by_type.get(entry.memory_type, 0) + 1
-            counts_by_role[entry.role] = counts_by_role.get(entry.role, 0) + 1
-
-        preview = [
-            {
-                "entry_id": entry.entry_id,
-                "role": entry.role,
-                "memory_type": entry.memory_type,
-                "content": entry.content if len(entry.content) <= 160 else f"{entry.content[:160]}...",
-                "timestamp": entry.timestamp.isoformat(),
-            }
-            for entry in recent_entries
-        ]
-        return {
-            "session_id": self.session_id,
-            "entry_count": len(self._entries),
-            "counts_by_type": counts_by_type,
-            "counts_by_role": counts_by_role,
-            "recent_entries": preview,
-        }
+        return self.manager.summarize(user_id=self.user_id, session_id=self.session_id, limit=limit)
 
     def stats(self) -> dict[str, Any]:
-        summary = self.summary(limit=min(3, len(self._entries)))
+        summary = self.summary(limit=min(3, max(self.store.count_entries(self.session_id), 1)))
         summary.update(
             {
                 "max_entries": self.max_entries,
                 "default_top_k": self.default_top_k,
                 "supported_memory_types": sorted(SUPPORTED_MEMORY_TYPES),
+                "working_ttl_minutes": self.working_ttl_minutes,
+                "profile_enabled": self.profile_enabled,
             }
         )
         return summary
@@ -276,17 +299,7 @@ class MemoryTool(Tool):
 
             return ToolResponse.success(
                 text=f"Stored memory entry {entry.entry_id} as {entry.memory_type} memory.",
-                data={
-                    "entry": {
-                        "entry_id": entry.entry_id,
-                        "role": entry.role,
-                        "content": entry.content,
-                        "memory_type": entry.memory_type,
-                        "timestamp": entry.timestamp.isoformat(),
-                        "importance": entry.importance,
-                        "metadata": entry.metadata,
-                    }
-                },
+                data={"entry": self._serialize_entry(entry)},
             )
 
         if action == "search":
@@ -308,28 +321,15 @@ class MemoryTool(Tool):
 
             return ToolResponse.success(
                 text=self.render_context(query, top_k=top_k, memory_types=memory_types),
-                data={
-                    "matches": [
-                        {
-                            "entry_id": entry.entry_id,
-                            "role": entry.role,
-                            "content": entry.content,
-                            "memory_type": entry.memory_type,
-                            "timestamp": entry.timestamp.isoformat(),
-                            "importance": entry.importance,
-                            "metadata": entry.metadata,
-                        }
-                        for entry in results
-                    ]
-                },
+                data={"matches": [self._serialize_entry(entry) for entry in results]},
             )
 
         if action == "summary":
             summary = self.summary()
             return ToolResponse.success(
                 text=(
-                    f"Memory summary for session {self.session_id}: "
-                    f"{summary['entry_count']} entries across {len(summary['counts_by_type'])} memory types."
+                    f"Memory summary for session {self.session_id} / user {self.user_id}: "
+                    f"{summary['entry_count']} entries and {summary['fact_count']} profile facts."
                 ),
                 data=summary,
             )
@@ -338,8 +338,8 @@ class MemoryTool(Tool):
             stats = self.stats()
             return ToolResponse.success(
                 text=(
-                    f"Memory stats for session {self.session_id}: "
-                    f"{stats['entry_count']} entries, max {stats['max_entries']}."
+                    f"Memory stats for session {self.session_id} / user {self.user_id}: "
+                    f"{stats['entry_count']} entries, {stats['fact_count']} facts, max {stats['max_entries']}."
                 ),
                 data=stats,
             )
@@ -367,17 +367,7 @@ class MemoryTool(Tool):
 
             return ToolResponse.success(
                 text=f"Updated memory entry {entry.entry_id}.",
-                data={
-                    "entry": {
-                        "entry_id": entry.entry_id,
-                        "role": entry.role,
-                        "content": entry.content,
-                        "memory_type": entry.memory_type,
-                        "timestamp": entry.timestamp.isoformat(),
-                        "importance": entry.importance,
-                        "metadata": entry.metadata,
-                    }
-                },
+                data={"entry": self._serialize_entry(entry)},
             )
 
         if action in {"remove", "forget"}:
@@ -401,11 +391,13 @@ class MemoryTool(Tool):
             )
 
         if action == "clear_all":
-            removed_count = len(self._entries)
-            self.clear_all()
+            counts = self.manager.clear_all_for_user_session(user_id=self.user_id, session_id=self.session_id)
             return ToolResponse.success(
-                text=f"Cleared {removed_count} memory entries for session {self.session_id}.",
-                data={"cleared": removed_count},
+                text=(
+                    f"Cleared {counts['entries_cleared']} session entries and "
+                    f"{counts['facts_cleared']} user facts for {self.user_id}."
+                ),
+                data=counts,
             )
 
         return ToolResponse.error(
@@ -424,65 +416,47 @@ class MemoryTool(Tool):
                 ),
                 required=True,
             ),
-            ToolParameter(
-                name="query",
-                type="string",
-                description="Query used by action=search.",
-                required=False,
-            ),
-            ToolParameter(
-                name="content",
-                type="string",
-                description="Memory content used by action=add or action=update.",
-                required=False,
-            ),
-            ToolParameter(
-                name="entry_id",
-                type="string",
-                description="Target memory entry id used by update/remove/forget.",
-                required=False,
-            ),
-            ToolParameter(
-                name="role",
-                type="string",
-                description="Role associated with the stored memory entry.",
-                required=False,
-                default="system",
-            ),
-            ToolParameter(
-                name="memory_type",
-                type="string",
-                description="One of working, episodic, semantic, perceptual.",
-                required=False,
-                default="working",
-            ),
-            ToolParameter(
-                name="memory_types",
-                type="array",
-                description="Optional list of memory types to filter during search.",
-                required=False,
-            ),
-            ToolParameter(
-                name="importance",
-                type="number",
-                description="Importance score between 0.0 and 1.0.",
-                required=False,
-                default=0.5,
-            ),
-            ToolParameter(
-                name="top_k",
-                type="integer",
-                description="Maximum number of memory hits to return for search.",
-                required=False,
-                default=self.default_top_k,
-            ),
-            ToolParameter(
-                name="metadata",
-                type="object",
-                description="Optional metadata object for add/update.",
-                required=False,
-            ),
+            ToolParameter(name="query", type="string", description="Query used by action=search.", required=False),
+            ToolParameter(name="content", type="string", description="Memory content used by action=add or action=update.", required=False),
+            ToolParameter(name="entry_id", type="string", description="Target memory entry id used by update/remove/forget.", required=False),
+            ToolParameter(name="role", type="string", description="Role associated with the stored memory entry.", required=False, default="system"),
+            ToolParameter(name="memory_type", type="string", description="One of working, episodic, semantic, perceptual.", required=False, default="working"),
+            ToolParameter(name="memory_types", type="array", description="Optional list of memory types to filter during search.", required=False),
+            ToolParameter(name="importance", type="number", description="Importance score between 0.0 and 1.0.", required=False, default=0.5),
+            ToolParameter(name="top_k", type="integer", description="Maximum number of memory hits to return for search.", required=False, default=self.default_top_k),
+            ToolParameter(name="metadata", type="object", description="Optional metadata object for add/update.", required=False),
         ]
+
+    def _build_metadata(self, metadata: dict[str, Any] | None) -> dict[str, Any]:
+        payload = dict(metadata or {})
+        payload.setdefault("session_id", self.session_id)
+        payload.setdefault("user_id", self.user_id)
+        payload.setdefault("source", payload.get("source", "conversation"))
+        return payload
+
+    @staticmethod
+    def _record_to_entry(record: MemoryRecord) -> MemoryEntry:
+        return MemoryEntry(
+            entry_id=record.entry_id,
+            role=record.role,
+            content=record.content,
+            memory_type=record.memory_type,
+            timestamp=record.timestamp,
+            importance=record.importance,
+            metadata=dict(record.metadata),
+        )
+
+    @staticmethod
+    def _serialize_entry(entry: MemoryEntry) -> dict[str, Any]:
+        return {
+            "entry_id": entry.entry_id,
+            "role": entry.role,
+            "content": entry.content,
+            "memory_type": entry.memory_type,
+            "timestamp": entry.timestamp.isoformat(),
+            "importance": entry.importance,
+            "metadata": entry.metadata,
+        }
 
     @staticmethod
     def _extract_action(parameters: dict[str, Any]) -> str:
@@ -584,7 +558,3 @@ class MemoryTool(Tool):
     @staticmethod
     def _clamp_importance(value: float) -> float:
         return max(0.0, min(float(value), 1.0))
-
-    @staticmethod
-    def _tokenize(text: str) -> list[str]:
-        return [match.group(0).lower() for match in TOKEN_PATTERN.finditer(text)]

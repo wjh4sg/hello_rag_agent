@@ -13,6 +13,10 @@ knowledge_base:
   chunk_overlap: 120
   top_k: 4
   retrieval_mode: hybrid
+  rerank_pool_size: 12
+  max_query_variants: 6
+  max_evidence_points: 4
+  snippet_max_chars: 220
   vector_store_dir: data/chroma_db
   collection_name: hello_rag_agent_kb
   embedding_model: text-embedding-v4
@@ -23,3 +27,12 @@ llm:
   base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
   temperature: 0.0
   max_tokens: 1200
+
+memory:
+  db_path: data/memory.db
+  working_max_entries: 80
+  working_ttl_minutes: 240
+  default_top_k: 4
+  profile_enabled: true
+  profile_max_facts: 50
+  assistant_memory_min_chars: 20

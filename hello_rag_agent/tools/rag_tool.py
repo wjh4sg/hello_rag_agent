@@ -67,11 +67,16 @@ class RAGTool(Tool):
 
         lines = []
         for index, item in enumerate(results, start=1):
-            content = item.chunk.content.strip()
-            preview = content if len(content) <= 500 else f"{content[:500]}..."
+            preview = item.snippet or item.chunk.content.strip()
+            if len(preview) > 500:
+                preview = f"{preview[:500]}..."
             lines.append(f"[Source {index}] file: {item.chunk.source}")
             lines.append(f"title: {item.chunk.title}")
+            lines.append(f"citation: {item.citation}")
+            lines.append(f"strategy: {item.strategy}")
             lines.append(f"score: {item.score:.4f}")
+            if item.match_terms:
+                lines.append(f"match_terms: {', '.join(item.match_terms)}")
             lines.append(f"content: {preview}")
             lines.append("")
         return "\n".join(lines).strip()
@@ -164,7 +169,11 @@ class RAGTool(Tool):
                         "chunk_id": item.chunk.chunk_id,
                         "source": item.chunk.source,
                         "title": item.chunk.title,
+                        "citation": item.citation,
                         "content": item.chunk.content,
+                        "snippet": item.snippet,
+                        "strategy": item.strategy,
+                        "match_terms": list(item.match_terms),
                         "score": item.score,
                     }
                     for item in results
@@ -225,7 +234,11 @@ class RAGTool(Tool):
                             "chunk_id": item.chunk.chunk_id,
                             "source": item.chunk.source,
                             "title": item.chunk.title,
+                            "citation": item.citation,
                             "content": item.chunk.content,
+                            "snippet": item.snippet,
+                            "strategy": item.strategy,
+                            "match_terms": list(item.match_terms),
                             "score": item.score,
                         }
                         for item in results

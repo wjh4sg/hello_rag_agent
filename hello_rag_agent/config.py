@@ -34,6 +34,10 @@ class KnowledgeBaseSettings:
     chunk_overlap: int
     top_k: int
     retrieval_mode: str
+    rerank_pool_size: int
+    max_query_variants: int
+    max_evidence_points: int
+    snippet_max_chars: int
     vector_store_dir: Path
     collection_name: str
     embedding_model: str
@@ -49,10 +53,22 @@ class LLMSettings:
 
 
 @dataclass(frozen=True)
+class MemorySettings:
+    db_path: Path
+    working_max_entries: int
+    working_ttl_minutes: int
+    default_top_k: int
+    profile_enabled: bool
+    profile_max_facts: int
+    assistant_memory_min_chars: int
+
+
+@dataclass(frozen=True)
 class AppSettings:
     agent: AgentSettings
     knowledge_base: KnowledgeBaseSettings
     llm: LLMSettings
+    memory: MemorySettings
     prompt_path: Path
 
     def resolve_api_key(self) -> str:
@@ -80,6 +96,7 @@ def load_settings(config_path: Path | None = None) -> AppSettings:
     agent_conf = raw.get("agent", {})
     kb_conf = raw.get("knowledge_base", {})
     llm_conf = raw.get("llm", {})
+    memory_conf = raw.get("memory", {})
 
     prompt_path = DEFAULT_PROMPT_PATH
 
@@ -96,6 +113,10 @@ def load_settings(config_path: Path | None = None) -> AppSettings:
             chunk_overlap=int(kb_conf.get("chunk_overlap", 120)),
             top_k=int(kb_conf.get("top_k", 4)),
             retrieval_mode=str(os.getenv("KB_RETRIEVAL_MODE", kb_conf.get("retrieval_mode", "hybrid"))),
+            rerank_pool_size=int(os.getenv("KB_RERANK_POOL_SIZE", kb_conf.get("rerank_pool_size", 12))),
+            max_query_variants=int(os.getenv("KB_MAX_QUERY_VARIANTS", kb_conf.get("max_query_variants", 6))),
+            max_evidence_points=int(os.getenv("KB_MAX_EVIDENCE_POINTS", kb_conf.get("max_evidence_points", 4))),
+            snippet_max_chars=int(os.getenv("KB_SNIPPET_MAX_CHARS", kb_conf.get("snippet_max_chars", 220))),
             vector_store_dir=(
                 BASE_DIR / os.getenv("KB_VECTOR_STORE_DIR", kb_conf.get("vector_store_dir", "data/chroma_db"))
             ).resolve(),
@@ -122,6 +143,27 @@ def load_settings(config_path: Path | None = None) -> AppSettings:
                 int(os.getenv("LLM_MAX_TOKENS", llm_conf.get("max_tokens")))
                 if os.getenv("LLM_MAX_TOKENS") or llm_conf.get("max_tokens") is not None
                 else None
+            ),
+        ),
+        memory=MemorySettings(
+            db_path=(BASE_DIR / os.getenv("MEMORY_DB_PATH", memory_conf.get("db_path", "data/memory.db"))).resolve(),
+            working_max_entries=int(
+                os.getenv("MEMORY_WORKING_MAX_ENTRIES", memory_conf.get("working_max_entries", 80))
+            ),
+            working_ttl_minutes=int(
+                os.getenv("MEMORY_WORKING_TTL_MINUTES", memory_conf.get("working_ttl_minutes", 240))
+            ),
+            default_top_k=int(os.getenv("MEMORY_DEFAULT_TOP_K", memory_conf.get("default_top_k", 4))),
+            profile_enabled=str(
+                os.getenv("MEMORY_PROFILE_ENABLED", memory_conf.get("profile_enabled", True))
+            ).strip().lower()
+            not in {"0", "false", "no", "off"},
+            profile_max_facts=int(os.getenv("MEMORY_PROFILE_MAX_FACTS", memory_conf.get("profile_max_facts", 50))),
+            assistant_memory_min_chars=int(
+                os.getenv(
+                    "MEMORY_ASSISTANT_MIN_CHARS",
+                    memory_conf.get("assistant_memory_min_chars", 20),
+                )
             ),
         ),
         prompt_path=prompt_path,

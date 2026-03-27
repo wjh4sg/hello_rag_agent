@@ -1,0 +1,142 @@
+[
+  {
+    "id": "memory_profile_001",
+    "query": "用户家里的地面、宠物和核心偏好是什么？",
+    "goal": "验证 MemoryTool 是否能召回用户画像类信息。",
+    "top_k": 5,
+    "entries": [
+      {
+        "role": "user",
+        "content": "我家是木地板，养了两只猫。",
+        "memory_type": "working",
+        "importance": 0.9
+      },
+      {
+        "role": "assistant",
+        "content": "已记录用户家庭环境：木地板、两只猫。",
+        "memory_type": "episodic",
+        "importance": 0.7
+      },
+      {
+        "role": "user",
+        "content": "我更在意静音和防缠绕。",
+        "memory_type": "working",
+        "importance": 0.9
+      }
+    ],
+    "expected_substrings": ["木地板", "两只猫", "静音"]
+  },
+  {
+    "id": "memory_continuity_001",
+    "query": "用户已经做过什么维护，还有什么问题？",
+    "goal": "验证 MemoryTool 能否串起维护状态与当前问题。",
+    "top_k": 3,
+    "entries": [
+      {
+        "role": "user",
+        "content": "上次我已经清洗过滤网，但还没更换边刷。",
+        "memory_type": "working",
+        "importance": 0.9
+      },
+      {
+        "role": "user",
+        "content": "APP 偶尔会掉线。",
+        "memory_type": "working",
+        "importance": 0.8
+      }
+    ],
+    "expected_substrings": ["清洗过滤网", "没更换边刷", "APP偶尔掉线"]
+  },
+  {
+    "id": "memory_recency_001",
+    "query": "用户现在最在意什么？",
+    "goal": "验证近期记忆是否优先于旧偏好。",
+    "top_k": 2,
+    "entries": [
+      {
+        "role": "user",
+        "content": "一开始我更在意吸力。",
+        "memory_type": "working",
+        "importance": 0.8,
+        "age_seconds": 7200
+      },
+      {
+        "role": "user",
+        "content": "最近我其实更在意静音。",
+        "memory_type": "working",
+        "importance": 0.8,
+        "age_seconds": 60
+      }
+    ],
+    "expected_substrings": ["静音"],
+    "expected_top1": "静音"
+  },
+  {
+    "id": "memory_type_filter_001",
+    "query": "最近一项待处理事项是什么？",
+    "goal": "验证 working 过滤是否能避免召回无关长期摘要。",
+    "top_k": 2,
+    "memory_types": ["working"],
+    "entries": [
+      {
+        "role": "assistant",
+        "content": "历史总结：用户长期关注扫拖一体机和木地板保护。",
+        "memory_type": "episodic",
+        "importance": 0.7
+      },
+      {
+        "role": "user",
+        "content": "今晚要先清理滚刷，再观察回充是否恢复正常。",
+        "memory_type": "working",
+        "importance": 0.95
+      }
+    ],
+    "expected_substrings": ["今晚要先清理滚刷", "回充是否恢复正常"],
+    "expected_top1": "今晚要先清理滚刷"
+  },
+  {
+    "id": "memory_profile_fact_002",
+    "query": "你还记得我家地面、宠物和偏好吗？",
+    "goal": "验证画像 facts 会被抽取并优先召回。",
+    "top_k": 4,
+    "entries": [
+      {
+        "role": "user",
+        "content": "请记住，我家是木地板，养了一只长毛猫。",
+        "memory_type": "working",
+        "importance": 0.95
+      },
+      {
+        "role": "user",
+        "content": "我更在意静音和APP稳定性。",
+        "memory_type": "working",
+        "importance": 0.95
+      }
+    ],
+    "expected_substrings": ["木地板", "长毛猫", "静音", "APP稳定性"]
+  },
+  {
+    "id": "memory_recency_cleanup_001",
+    "query": "用户现在更在意什么？",
+    "goal": "验证新近偏好优先于旧工作记忆。",
+    "top_k": 2,
+    "entries": [
+      {
+        "role": "user",
+        "content": "一开始我更在意吸力。",
+        "memory_type": "working",
+        "importance": 0.7,
+        "age_seconds": 86400
+      },
+      {
+        "role": "user",
+        "content": "最近我更在意静音。",
+        "memory_type": "working",
+        "importance": 0.8,
+        "age_seconds": 60
+      }
+    ],
+    "expected_substrings": ["静音"],
+    "expected_top1": "静音"
+  }
+]

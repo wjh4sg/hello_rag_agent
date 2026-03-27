@@ -1,0 +1,59 @@
+[
+  {
+    "id": "session_profile_001",
+    "goal": "验证多轮对话后，系统仍能回忆用户家庭环境与偏好。",
+    "user_id": "eval_user_profile",
+    "turns": [
+      "请记住，我家是木地板，养了一只长毛猫。",
+      "我更在意静音和APP稳定性。"
+    ],
+    "recall_query": "你还记得我家地面、宠物和我最在意的点吗？",
+    "expected_memory_substrings": ["木地板", "长毛猫", "静音", "APP稳定性"],
+    "expected_answer_substrings": ["木地板", "长毛猫", "静音", "APP稳定性"],
+    "top_k": 4,
+    "min_answer_hit_rate": 1.0
+  },
+  {
+    "id": "session_purchase_001",
+    "goal": "验证系统能否保留用户的户型和使用诉求。",
+    "user_id": "eval_user_purchase",
+    "turns": [
+      "请记一下，我家 120 平，想买适合大户型的扫地机器人。",
+      "我不希望经常手动清空尘盒。"
+    ],
+    "recall_query": "你还记得我的户型和使用诉求吗？",
+    "expected_memory_substrings": ["120 平", "大户型", "不希望经常手动清空尘盒"],
+    "expected_answer_substrings": ["120", "大户型", "手动清空尘盒"],
+    "top_k": 4,
+    "min_answer_hit_rate": 1.0
+  },
+  {
+    "id": "session_maintenance_001",
+    "goal": "验证系统能否记住最近维护动作与剩余问题。",
+    "user_id": "eval_user_maintenance",
+    "turns": [
+      "帮我记一下，我上周刚洗过过滤网，但滚刷还没清理。",
+      "最近回充偶尔失败。"
+    ],
+    "recall_query": "你还记得我最近做过什么维护，还有什么问题吗？",
+    "expected_memory_substrings": ["洗过过滤网", "滚刷还没清理", "回充偶尔失败"],
+    "expected_answer_substrings": ["洗过过滤网", "滚刷", "回充偶尔失败"],
+    "top_k": 4,
+    "min_answer_hit_rate": 1.0
+  },
+  {
+    "id": "session_persistence_001",
+    "goal": "验证会话记忆写入 SQLite 后，在服务重建后仍可召回。",
+    "user_id": "eval_user_persistence",
+    "turns": [
+      "请记住，我家是木地板，养了一只长毛猫。",
+      "我更在意静音和APP稳定性。"
+    ],
+    "recall_query": "你还记得我家地面、宠物和我最在意的点吗？",
+    "expected_memory_substrings": ["木地板", "长毛猫", "静音", "APP稳定性"],
+    "expected_answer_substrings": ["木地板", "长毛猫", "静音", "APP稳定性"],
+    "top_k": 4,
+    "min_answer_hit_rate": 1.0,
+    "reload_service_before_recall": true
+  }
+]

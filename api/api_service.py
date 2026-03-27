@@ -13,11 +13,13 @@ service = get_service()
 class ChatRequest(BaseModel):
     query: str
     session_id: str | None = None
+    user_id: str | None = None
 
 
 class ChatResponse(BaseModel):
     response: str
     session_id: str
+    user_id: str
     message_count: int
 
 
@@ -32,11 +34,12 @@ def health_check():
 
 def _run_chat(request: ChatRequest) -> ChatResponse:
     try:
-        response, session_id = service.ask(request.query, request.session_id)
+        response, session_id = service.ask(request.query, request.session_id, user_id=request.user_id)
         history = service.get_history(session_id)
         return ChatResponse(
             response=response,
             session_id=session_id,
+            user_id=service.get_user_id(session_id) or request.user_id or f"session:{session_id}",
             message_count=len(history),
         )
     except Exception as exc:
@@ -69,6 +72,7 @@ def reset_session(request: ResetRequest):
 def get_session(session_id: str):
     return {
         "session_id": session_id,
+        "user_id": service.get_user_id(session_id),
         "history": service.get_history(session_id),
     }
 
