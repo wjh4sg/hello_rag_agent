@@ -2,41 +2,73 @@
   {
     "id": "overview_001",
     "question": "这个知识库主要讲什么？",
-    "goal": "判断系统能否概括知识库主题范围。"
+    "goal": "判断系统能否概括知识库主题范围。",
+    "expected_substrings": ["选购", "维护", "故障"],
+    "min_hit_rate": 0.67,
+    "forbidden_substrings": ["\"action\"", "rag_tool", "memory_tool"]
   },
   {
     "id": "selection_001",
     "question": "扫地机器人适合大户型时，应该重点关注哪些参数？",
-    "goal": "判断系统能否回答选购建议类问题。"
+    "goal": "判断系统能否回答选购建议类问题。",
+    "expected_substrings": ["大户型", "续航", "集尘"],
+    "min_hit_rate": 0.67,
+    "forbidden_substrings": ["\"action\"", "rag_tool", "memory_tool"]
   },
   {
     "id": "selection_002",
     "question": "扫地机器人是不是吸力越大越好？",
-    "goal": "判断系统能否处理常见的选购误区。"
+    "goal": "判断系统能否处理常见的选购误区。",
+    "expected_substrings": ["吸力", "不是", "场景"],
+    "min_hit_rate": 0.67,
+    "forbidden_substrings": ["\"action\"", "rag_tool", "memory_tool"]
   },
   {
     "id": "maintenance_001",
     "question": "扫地机器人日常维护通常包括哪些内容？",
-    "goal": "判断系统能否总结维护保养知识。"
+    "goal": "判断系统能否总结维护保养知识。",
+    "expected_substrings": ["滚刷", "边刷", "滤网"],
+    "min_hit_rate": 0.67,
+    "forbidden_substrings": ["\"action\"", "rag_tool", "memory_tool"]
   },
   {
     "id": "maintenance_002",
     "question": "滚刷、边刷和滤网一般需要多久清理或更换一次？",
-    "goal": "判断系统能否回答保养周期类问题。"
+    "goal": "判断系统能否回答保养周期类问题。",
+    "expected_substrings": ["滚刷", "边刷", "滤网"],
+    "min_hit_rate": 0.67,
+    "forbidden_substrings": ["\"action\"", "rag_tool", "memory_tool"]
   },
   {
     "id": "troubleshooting_001",
     "question": "机器人无法回充时，一般应该怎么排查？",
-    "goal": "判断系统能否提供故障排查步骤。"
+    "goal": "判断系统能否提供故障排查步骤。",
+    "expected_substrings": ["回充", "排查", "充电座"],
+    "min_hit_rate": 0.67,
+    "forbidden_substrings": ["\"action\"", "rag_tool", "memory_tool", "WiFi", "路由器"]
   },
   {
     "id": "troubleshooting_002",
     "question": "APP 连不上扫地机器人时，通常应该检查什么？",
-    "goal": "判断系统能否处理连接类故障。"
+    "goal": "判断系统能否处理连接类故障。",
+    "expected_substrings": ["APP", "网络", "重启"],
+    "min_hit_rate": 0.67,
+    "forbidden_substrings": ["\"action\"", "rag_tool", "memory_tool", "回充", "充电座"]
+  },
+  {
+    "id": "troubleshooting_wifi_001",
+    "question": "机器人无法连接WiFi",
+    "goal": "判断系统能否聚焦 WiFi 配网问题，不混入回充等无关故障。",
+    "expected_substrings": ["WiFi", "2.4G", "路由器"],
+    "min_hit_rate": 0.67,
+    "forbidden_substrings": ["\"action\"", "rag_tool", "memory_tool", "回充", "充电座", "出水"]
   },
   {
     "id": "troubleshooting_003",
     "question": "扫拖一体机器人出水异常时，通常有哪些可能原因？",
-    "goal": "判断系统能否结合故障主题给出结构化排查建议。"
+    "goal": "判断系统能否结合故障主题给出结构化排查建议。",
+    "expected_substrings": ["出水", "水箱", "堵塞"],
+    "min_hit_rate": 0.67,
+    "forbidden_substrings": ["\"action\"", "rag_tool", "memory_tool", "WiFi", "路由器"]
   }
 ]

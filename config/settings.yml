@@ -11,10 +11,17 @@ knowledge_base:
     - .pdf
   chunk_size: 600
   chunk_overlap: 120
+  atomic_chunking_enabled: true
+  atomic_chunk_max_chars: 320
   top_k: 4
   retrieval_mode: hybrid
   rerank_pool_size: 12
+  reranker_enabled: true
+  reranker_semantic_weight: 0.55
   max_query_variants: 6
+  query_rewrite_enabled: true
+  query_rewrite_model: tongyi-xiaomi-analysis-pro
+  query_rewrite_max_keywords: 6
   max_evidence_points: 4
   snippet_max_chars: 220
   vector_store_dir: data/chroma_db

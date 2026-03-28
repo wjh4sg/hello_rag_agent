@@ -1,0 +1,36 @@
+[
+  {
+    "id": "fusion_selection_profile_001",
+    "goal": "验证用户画像会进入检索查询，并帮助选购类问题命中更贴近家庭环境的证据。",
+    "user_id": "eval_fusion_selection",
+    "turns": [
+      "请记住，我家是木地板，还养了一只长毛猫。",
+      "我更在意静音和防缠毛。"
+    ],
+    "query": "结合我家情况，推荐扫地机器人时应该重点看哪些参数？",
+    "expected_memory_substrings": ["木地板", "长毛猫", "静音"],
+    "expected_query_substrings": ["用户场景", "木地板", "长毛猫"],
+    "expected_sources": ["选购指南.txt", "扫地机器人100问.txt"],
+    "expected_keywords": ["静音", "缠毛", "木地板", "参数"],
+    "expected_answer_substrings": ["木地板", "静音", "缠毛"],
+    "top_k": 4,
+    "min_answer_hit_rate": 0.67
+  },
+  {
+    "id": "fusion_maintenance_profile_001",
+    "goal": "验证历史维护状态会进入检索上下文，并帮助系统优先召回维护保养类证据。",
+    "user_id": "eval_fusion_maintenance",
+    "turns": [
+      "帮我记一下，我上周刚洗过过滤网，但滚刷还没清理。",
+      "最近回充偶尔失败。"
+    ],
+    "query": "结合我最近的情况，接下来应该先做哪些维护或排查？",
+    "expected_memory_substrings": ["洗过过滤网", "滚刷还没清理", "回充偶尔失败"],
+    "expected_query_substrings": ["用户场景", "滚刷", "回充"],
+    "expected_sources": ["维护保养.txt", "故障排除.txt"],
+    "expected_keywords": ["滚刷", "过滤网", "回充", "排查"],
+    "expected_answer_substrings": ["滚刷", "过滤网", "回充"],
+    "top_k": 4,
+    "min_answer_hit_rate": 0.67
+  }
+]

@@ -32,10 +32,17 @@ class KnowledgeBaseSettings:
     supported_extensions: tuple[str, ...]
     chunk_size: int
     chunk_overlap: int
+    atomic_chunking_enabled: bool
+    atomic_chunk_max_chars: int
     top_k: int
     retrieval_mode: str
     rerank_pool_size: int
+    reranker_enabled: bool
+    reranker_semantic_weight: float
     max_query_variants: int
+    query_rewrite_enabled: bool
+    query_rewrite_model: str
+    query_rewrite_max_keywords: int
     max_evidence_points: int
     snippet_max_chars: int
     vector_store_dir: Path
@@ -111,10 +118,37 @@ def load_settings(config_path: Path | None = None) -> AppSettings:
             supported_extensions=tuple(kb_conf.get("supported_extensions", [".txt", ".md", ".pdf"])),
             chunk_size=int(kb_conf.get("chunk_size", 600)),
             chunk_overlap=int(kb_conf.get("chunk_overlap", 120)),
+            atomic_chunking_enabled=str(
+                os.getenv("KB_ATOMIC_CHUNKING_ENABLED", kb_conf.get("atomic_chunking_enabled", True))
+            ).strip().lower()
+            not in {"0", "false", "no", "off"},
+            atomic_chunk_max_chars=int(
+                os.getenv("KB_ATOMIC_CHUNK_MAX_CHARS", kb_conf.get("atomic_chunk_max_chars", 320))
+            ),
             top_k=int(kb_conf.get("top_k", 4)),
             retrieval_mode=str(os.getenv("KB_RETRIEVAL_MODE", kb_conf.get("retrieval_mode", "hybrid"))),
             rerank_pool_size=int(os.getenv("KB_RERANK_POOL_SIZE", kb_conf.get("rerank_pool_size", 12))),
+            reranker_enabled=str(
+                os.getenv("KB_RERANKER_ENABLED", kb_conf.get("reranker_enabled", True))
+            ).strip().lower()
+            not in {"0", "false", "no", "off"},
+            reranker_semantic_weight=float(
+                os.getenv("KB_RERANKER_SEMANTIC_WEIGHT", kb_conf.get("reranker_semantic_weight", 0.55))
+            ),
             max_query_variants=int(os.getenv("KB_MAX_QUERY_VARIANTS", kb_conf.get("max_query_variants", 6))),
+            query_rewrite_enabled=str(
+                os.getenv("KB_QUERY_REWRITE_ENABLED", kb_conf.get("query_rewrite_enabled", True))
+            ).strip().lower()
+            not in {"0", "false", "no", "off"},
+            query_rewrite_model=str(
+                os.getenv(
+                    "KB_QUERY_REWRITE_MODEL",
+                    kb_conf.get("query_rewrite_model", os.getenv("LLM_MODEL_ID", "qwen-plus")),
+                )
+            ),
+            query_rewrite_max_keywords=int(
+                os.getenv("KB_QUERY_REWRITE_MAX_KEYWORDS", kb_conf.get("query_rewrite_max_keywords", 6))
+            ),
             max_evidence_points=int(os.getenv("KB_MAX_EVIDENCE_POINTS", kb_conf.get("max_evidence_points", 4))),
             snippet_max_chars=int(os.getenv("KB_SNIPPET_MAX_CHARS", kb_conf.get("snippet_max_chars", 220))),
             vector_store_dir=(

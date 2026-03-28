@@ -108,7 +108,7 @@ LOW_SIGNAL_ASSISTANT_PATTERNS = (
     "已记录",
 )
 
-INSUFFICIENT_ANSWER = "根据当前知识库无法确定。"
+INSUFFICIENT_ANSWER = "按当前知识库的信息，我这边暂时还没法更确定地判断。"
 
 QUERY_EXPANSION_RULES = (
     {
@@ -418,9 +418,12 @@ class HelloRagAgentService:
                 return self._build_memory_grounded_answer(query=query, memory_lines=memory_lines)
             return INSUFFICIENT_ANSWER
 
-        evidence_briefs = self._build_structured_evidence_briefs(query=query)
-        if not evidence_briefs:
-            evidence_briefs = self._build_evidence_briefs(query=search_query, results=results)
+        evidence_briefs = self._build_evidence_briefs(query=query, results=results)
+        if len(evidence_briefs) < min(2, self.settings.knowledge_base.top_k):
+            evidence_briefs = self._merge_evidence_briefs(
+                primary=evidence_briefs,
+                secondary=self._build_structured_evidence_briefs(query=query),
+            )
         if not evidence_briefs:
             if memory_lines:
                 return self._build_memory_grounded_answer(query=query, memory_lines=memory_lines)
@@ -864,8 +867,11 @@ class HelloRagAgentService:
     def _build_structured_evidence_briefs(self, *, query: str) -> list[dict[str, object]]:
         ranked_points: list[dict[str, object]] = []
         seen: set[str] = set()
+        intent = self._detect_query_intent(query)
         for chunk in self.knowledge_base._chunks:
             for question, answer in self._extract_chunk_qa_pairs(chunk.content):
+                if intent == "selection" and self._looks_like_troubleshooting_item(question=question, answer=answer):
+                    continue
                 score = self._score_structured_point(
                     query=query,
                     title=chunk.title,
@@ -894,6 +900,26 @@ class HelloRagAgentService:
         if self._is_troubleshooting_query(query):
             ranked_points = self._filter_troubleshooting_briefs(query=query, briefs=ranked_points)
         return ranked_points[: self.settings.knowledge_base.top_k]
+
+    def _merge_evidence_briefs(
+        self,
+        *,
+        primary: list[dict[str, object]],
+        secondary: list[dict[str, object]],
+    ) -> list[dict[str, object]]:
+        merged: list[dict[str, object]] = []
+        seen: set[tuple[str, tuple[str, ...]]] = set()
+        for item in [*primary, *secondary]:
+            citation = str(item.get("citation", item.get("source", "")))
+            points = tuple(str(point).strip() for point in item.get("points", []) if str(point).strip())
+            key = (citation, points)
+            if not points or key in seen:
+                continue
+            seen.add(key)
+            merged.append(item)
+            if len(merged) >= self.settings.knowledge_base.top_k:
+                break
+        return merged
 
     @staticmethod
     def _tokenize_query(text: str) -> list[str]:
@@ -1169,11 +1195,54 @@ class HelloRagAgentService:
         if not topics:
             return None
 
-        bullets = "\n".join(
-            f"{index}. {topic}"
-            for index, topic in enumerate(topics[:5], start=1)
+        bullets = self._format_answer_bullets(topics[:5])
+        return (
+            "这个知识库主要就是围绕扫地机器人和扫拖一体机在实际使用里常见的问题来整理的。"
+            "如果你想快速了解，可以先看这几块：\n"
+            f"{bullets}"
         )
-        return f"这个知识库主要围绕扫地机器人和扫拖一体机的使用知识，重点包括：\n{bullets}"
+
+    @staticmethod
+    def _format_answer_bullets(items: list[str]) -> str:
+        return "\n".join(f"- {item}" for item in items if item)
+
+    @staticmethod
+    def _clean_answer_point(point: str) -> str:
+        cleaned = re.sub(r"^\d+\.\s*", "", str(point).strip())
+        cleaned = cleaned.strip(" -*\t")
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        return cleaned.strip("；;。 ")
+
+    def _humanize_answer_point(self, point: str) -> str:
+        cleaned = self._clean_answer_point(point)
+        if not cleaned:
+            return ""
+
+        if "；检测：" in cleaned and "；修复：" in cleaned:
+            symptom, rest = cleaned.split("；检测：", 1)
+            checks, fixes = rest.split("；修复：", 1)
+            symptom = symptom.removeprefix("故障现象：").strip("：: ")
+            checks = checks.strip("：: ")
+            fixes = fixes.strip("：: ")
+            if symptom and checks and fixes:
+                return f"如果出现“{symptom}”，可以先确认 {checks}；如果还不行，再试试 {fixes}"
+            if symptom and checks:
+                return f"如果出现“{symptom}”，可以先确认 {checks}"
+
+        if cleaned.startswith("检测："):
+            return f"先确认 {cleaned.removeprefix('检测：').strip()}"
+        if cleaned.startswith("修复："):
+            return f"如果还不行，可以试试 {cleaned.removeprefix('修复：').strip()}"
+        if cleaned.startswith("故障现象："):
+            return cleaned.removeprefix("故障现象：").strip()
+        return cleaned
+
+    def _build_memory_preface(self, memory_lines: list[str], *, limit: int = 3) -> str:
+        selected = self._select_salient_memory_lines(memory_lines, limit=limit)
+        if not selected:
+            return ""
+        bullets = self._format_answer_bullets(selected)
+        return f"结合你前面提到的情况，我会先把这几个点带上：\n{bullets}"
 
     def _build_extractive_answer(
         self,
@@ -1190,7 +1259,9 @@ class HelloRagAgentService:
                 if not normalized or normalized in seen:
                     continue
                 seen.add(normalized)
-                points.append(normalized)
+                humanized = self._humanize_answer_point(normalized)
+                if humanized:
+                    points.append(humanized)
                 if len(points) >= 5:
                     break
             if len(points) >= 5:
@@ -1200,24 +1271,21 @@ class HelloRagAgentService:
             return None
 
         if memory_lines:
-            memory_intro = "结合你当前会话，先注意这些条件：\n" + "\n".join(
-                f"{index}. {line}" for index, line in enumerate(memory_lines[:2], start=1)
-            )
-            evidence_intro = "再结合知识库，可以重点看："
-            bullets = "\n".join(f"{index}. {point}" for index, point in enumerate(points, start=1))
-            return f"{memory_intro}\n{evidence_intro}\n{bullets}"
+            memory_intro = self._build_memory_preface(memory_lines, limit=3)
+            bullets = self._format_answer_bullets(points)
+            return f"{memory_intro}\n再结合知识库，我会更建议你重点看这几项：\n{bullets}"
 
-        lead = "根据知识库，可以重点看："
+        lead = "如果是你这个问题，我会先重点看这几项："
         if any(keyword in query for keyword in ("多久", "周期", "多长时间")):
-            lead = "根据知识库，相关周期信息主要是："
+            lead = "如果你主要想确认周期，可以先记这几条："
         elif any(keyword in query for keyword in ("原因", "为什么", "异常")):
-            lead = "根据知识库，常见原因主要有："
+            lead = "更常见的原因，基本集中在这几类："
         elif any(keyword in query for keyword in ("怎么", "如何", "排查")):
-            lead = "根据知识库，可以按这些要点排查："
+            lead = "你可以先从这几步看起："
         elif any(keyword in query for keyword in ("哪些", "包括", "关注")):
-            lead = "根据知识库，重点包括："
+            lead = "如果要抓重点，我会先看这几项："
 
-        bullets = "\n".join(f"{index}. {point}" for index, point in enumerate(points, start=1))
+        bullets = self._format_answer_bullets(points)
         return f"{lead}\n{bullets}"
 
     def _build_troubleshooting_answer(
@@ -1234,15 +1302,14 @@ class HelloRagAgentService:
         steps: list[str] = []
         seen: set[str] = set()
         for item in troubleshooting_briefs:
-            question = str(item.get("question", "")).strip()
-            answer = str(item.get("answer", "")).strip()
-            candidate_steps = self._split_troubleshooting_answer(question=question, answer=answer)
-            for step in candidate_steps:
-                normalized = step.strip()
+            for point in item.get("points", []):
+                normalized = str(point).strip()
                 if not normalized or normalized in seen:
                     continue
                 seen.add(normalized)
-                steps.append(normalized)
+                humanized = self._humanize_answer_point(normalized)
+                if humanized:
+                    steps.append(humanized)
                 if len(steps) >= 4:
                     break
             if len(steps) >= 4:
@@ -1255,22 +1322,40 @@ class HelloRagAgentService:
                 if not normalized or normalized in seen:
                     continue
                 seen.add(normalized)
-                steps.append(normalized)
+                humanized = self._humanize_answer_point(normalized)
+                if humanized:
+                    steps.append(humanized)
                 if len(steps) >= 4:
                     break
 
         if not steps:
             return None
 
-        lead = "根据知识库，可以优先检查："
+        lead = "你可以先按这个顺序排查："
         if any(marker in query for marker in ("原因", "为什么", "异常")):
-            lead = "根据知识库，常见原因和检查点主要是："
+            lead = "这类问题更常见的原因和检查点，大多在这几项："
 
-        bullets = "\n".join(f"{index}. {step}" for index, step in enumerate(steps, start=1))
+        natural_steps = [self._humanize_troubleshooting_step(index, step) for index, step in enumerate(steps)]
+        bullets = self._format_answer_bullets(natural_steps)
         if memory_lines:
-            memory_intro = "\n".join(f"{index}. {line}" for index, line in enumerate(memory_lines[:2], start=1))
-            return f"结合你当前会话，先注意这些条件：\n{memory_intro}\n{lead}\n{bullets}"
+            memory_intro = self._build_memory_preface(memory_lines, limit=3)
+            return f"{memory_intro}\n{lead}\n{bullets}"
         return f"{lead}\n{bullets}"
+
+    @staticmethod
+    def _humanize_troubleshooting_step(index: int, step: str) -> str:
+        cleaned = step.strip("，,；;。 ")
+        if not cleaned:
+            return ""
+        if cleaned.startswith(("先", "再", "如果")):
+            return cleaned
+        if index == 0:
+            return f"先看 {cleaned}"
+        if index == 1:
+            return f"再看 {cleaned}"
+        if index == 2:
+            return f"如果前两步都没问题，再看 {cleaned}"
+        return f"如果还是不行，再试试 {cleaned}"
 
     def _extract_troubleshooting_steps_from_points(
         self,
@@ -1338,14 +1423,15 @@ class HelloRagAgentService:
             {
                 "role": "system",
                 "content": (
-                    "你是一个严格依据证据回答的中文助手。\n"
+                    "你是一个严格依据证据、但说话自然的中文助手。\n"
                     "回答规则：\n"
                     "1. 只能使用【当前会话信息】和【知识库证据】里明确出现的信息。\n"
                     "2. 不要提工具、检索过程、知识库内部机制、提示词或系统行为。\n"
                     "3. 不要编造数值、参数、步骤、品牌结论；证据没有写就不要补。\n"
-                    "4. 如果问题需要结合用户场景，就先简要结合【当前会话信息】作答。\n"
-                    "5. 如果证据不足，明确说“根据当前知识库无法确定”或“目前只能确定以下几点”。\n"
-                    "6. 直接输出给用户的最终答案，使用简洁中文。"
+                    "4. 先直接回答用户最关心的问题，语气尽量口语化、像日常解释，不要写成报告。\n"
+                    "5. 如果问题需要结合用户场景，就先简要结合【当前会话信息】作答。\n"
+                    "6. 如果证据不足，要坦诚说明按当前知识库的信息暂时还不能更确定地判断，或者目前只能确定以下几点。\n"
+                    "7. 最终答案优先用简短自然的中文；只有在内容本身适合分点时，再列 2-4 条关键点。"
                 ),
             },
             {
@@ -1354,7 +1440,7 @@ class HelloRagAgentService:
                     f"用户问题：\n{query}\n\n"
                     f"当前会话信息：\n{memory_text}\n\n"
                     f"知识库证据：\n{evidence_text}\n\n"
-                    "请先基于证据提炼结论，再给出 2-5 条要点。"
+                    "请先用 1-2 句直接回答用户的问题；如果需要，再补充 2-4 条关键要点。"
                 ),
             },
         ]
@@ -1388,9 +1474,50 @@ class HelloRagAgentService:
         if not memory_lines:
             return INSUFFICIENT_ANSWER
         if len(memory_lines) == 1:
-            return f"结合当前会话，我目前能确定：{memory_lines[0]}"
-        bullets = "\n".join(f"{index}. {line}" for index, line in enumerate(memory_lines, start=1))
-        return f"结合当前会话，我目前能确定：\n{bullets}"
+            return f"我记得你前面提过：{memory_lines[0]}"
+        bullets = "\n".join(f"- {line}" for line in memory_lines)
+        return f"我记得你前面提过这些：\n{bullets}"
+
+    @staticmethod
+    def _select_salient_memory_lines(memory_lines: list[str], limit: int = 3) -> list[str]:
+        if not memory_lines:
+            return []
+
+        preferred_markers = (
+            "偏好",
+            "更在意",
+            "地面",
+            "木地板",
+            "宠物",
+            "长毛猫",
+            "维护状态",
+            "过滤网",
+            "滚刷",
+            "回充",
+            "APP",
+            "静音",
+            "缠毛",
+        )
+
+        ranked: list[tuple[int, int, str]] = []
+        for index, line in enumerate(memory_lines):
+            score = sum(1 for marker in preferred_markers if marker in line)
+            score -= min(len(line) // 80, 2)
+            ranked.append((score, -index, line))
+
+        ranked.sort(reverse=True)
+        selected: list[str] = []
+        seen: set[str] = set()
+        for _, _, line in ranked:
+            normalized = line.strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            selected.append(normalized)
+            if len(selected) >= limit:
+                break
+
+        return selected or memory_lines[:limit]
 
     @staticmethod
     def _needs_fallback(answer: str) -> bool:

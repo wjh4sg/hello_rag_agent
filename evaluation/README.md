@@ -1,84 +1,74 @@
-# 项目评测说明
+# 项目评估说明
 
-这套评测不是只看“最后一句答得像不像”，而是按当前项目的真实链路拆成 4 层：
+这套评估不是只看“最后一句答得像不像”，而是按当前项目的真实链路拆成多层：
 
 1. `retrieval`
-   评估知识库检索是否命中正确来源与关键信号。
-   适合回归分块、召回策略、向量库状态变化。
-
+   评估知识库检索是否命中正确来源、关键内容、可读 snippet 和引用信息。
 2. `memory`
-   评估 `MemoryTool` 的工具级回忆能力。
-   适合回归记忆打分、类型过滤、近期优先级。
-
+   评估 `MemoryTool` 的检索、排序、类型过滤和近期优先能力。
 3. `session`
-   评估多轮对话后的会话记忆是否真的能被找回，并进入最终回答。
-   适合回归“用户刚说过的话还记不记得”这类体验问题。
-
-4. `answer`
-   保留现有 `RAG + LLM judge` 评测。
-   适合看最终回答的 groundedness、relevance、completeness、clarity。
+   评估多轮对话后，系统是否还能正确回忆当前会话和用户画像。
+4. `fusion`
+   评估“记忆是否真的参与了检索”，也就是记忆召回、检索 query 拼接、证据命中和最终回答是否一致。
+5. `answer`
+   保留 `RAG + LLM judge` 评估，同时加入规则化检查，避免只靠 judge 打分。
+6. `answer_smoke`
+   轻量回答冒烟评测，适合开发中快速回归。
 
 ## 为什么这样设计
 
 当前项目的核心链路是：
 
 - 本地知识库检索
-- 会话级 MemoryTool
-- ContextBuilder 拼装上下文
-- ReActAgent 作答
-- 必要时走 `rag_tool.ask` 兜底
+- 用户级 + 会话级记忆
+- 上下文拼装
+- 直接检索回答 / Agent 回答
 
 如果只看最后回答，很难判断问题出在：
 
 - 检索没命中
 - 记忆没召回
-- 会话上下文丢了
-- 还是模型回答阶段幻觉
+- 记忆没有正确影响检索
+- 还是生成阶段把证据用坏了
 
-所以评测必须分层，才能真正支撑后续改造。
+所以评估必须分层。
 
 ## 运行方式
 
-开发态快跑，默认只跑轻量回归，不跑 LLM judge：
+开发态快速回归：
 
 ```bash
 .venv\Scripts\python.exe evaluation\run_project_eval.py --profile dev
 ```
 
-PowerShell 下也可以直接用快捷脚本：
-
-```powershell
-.\evaluation\run_dev_eval.ps1
-```
-
-如果你只想更快看 1 个样例，也可以再限制 case 数量：
-
-```bash
-.venv\Scripts\python.exe evaluation\run_project_eval.py --profile dev --max-cases 1
-```
-
-只跑离线能力评测：
+只跑检索和记忆：
 
 ```bash
 .venv\Scripts\python.exe evaluation\run_project_eval.py --suites retrieval,memory
 ```
 
-跑会话记忆评测：
+只跑记忆-检索协同：
+
+```bash
+.venv\Scripts\python.exe evaluation\run_project_eval.py --suites fusion
+```
+
+只跑会话记忆：
 
 ```bash
 .venv\Scripts\python.exe evaluation\run_project_eval.py --suites session
 ```
 
-跑完整评测：
+跑完整评估：
 
 ```bash
-.venv\Scripts\python.exe evaluation\run_project_eval.py --suites retrieval,memory,session,answer
+.venv\Scripts\python.exe evaluation\run_project_eval.py --suites retrieval,memory,session,fusion,answer
 ```
 
-自定义 judge 模型：
+限制 case 数量做快速检查：
 
 ```bash
-.venv\Scripts\python.exe evaluation\run_project_eval.py --suites answer --judge-model qwen3.5-plus
+.venv\Scripts\python.exe evaluation\run_project_eval.py --profile dev --max-cases 1
 ```
 
 ## 输出内容
@@ -90,44 +80,58 @@ PowerShell 下也可以直接用快捷脚本：
 
 其中：
 
-- JSON 适合后续接 CI、画趋势图、做版本对比
-- Markdown 适合人工查看和周报汇总
+- JSON 适合后续做版本对比、自动化接入、画趋势图
+- Markdown 适合人工查看和答辩展示
 
 ## 当前重点指标
 
-`retrieval`:
+`retrieval`
 
 - `source_hit_rate`
 - `avg_keyword_hit_rate`
+- `avg_snippet_keyword_hit_rate`
+- `avg_citation_coverage_rate`
+- `avg_source_diversity`
 - `avg_first_hit_rank`
 
-`memory`:
+`memory`
 
 - `avg_substring_hit_rate`
 - `top1_ok_rate`
 
-`session`:
+`session`
 
 - `avg_memory_hit_rate`
 - `avg_answer_hit_rate`
 - `trace_leak_rate`
 
-`answer`:
+`fusion`
+
+- `avg_memory_hit_rate`
+- `avg_query_hit_rate`
+- `source_hit_rate`
+- `avg_keyword_hit_rate`
+- `avg_answer_hit_rate`
+
+`answer`
 
 - `average_score`
 - `groundedness / relevance / completeness / clarity`
+- `rule_pass_rate`
+- `avg_substring_hit_rate`
+- `forbidden_hit_rate`
 - `trace_leak_rate`
 
-`answer_smoke`:
+`answer_smoke`
 
 - `avg_substring_hit_rate`
-- `trace_leak_rate`
 - `forbidden_hit_rate`
+- `trace_leak_rate`
 
 ## 使用建议
 
-1. 改检索前后，至少跑 `retrieval + answer`
-2. 改记忆前后，至少跑 `memory + session`
-3. 平时开发先跑 `--profile dev`，只有准备提交或看总分时再跑全量 `answer`
-4. 如果 `answer` 退化，但 `retrieval` 没退化，优先排查回答阶段
-5. 如果 `session` 退化，但 `memory` 正常，优先排查上下文拼装与会话链路
+1. 改检索逻辑后，至少跑 `retrieval + fusion + answer`
+2. 改记忆逻辑后，至少跑 `memory + session + fusion`
+3. 平时开发优先跑 `--profile dev`
+4. 如果 `fusion` 退化但 `retrieval` 没退化，优先排查“记忆是否正确参与检索”
+5. 如果 `answer` 退化但 `retrieval` 和 `fusion` 正常，优先排查回答生成阶段

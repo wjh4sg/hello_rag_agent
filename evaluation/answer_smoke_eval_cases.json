@@ -2,25 +2,41 @@
   {
     "id": "overview_smoke_001",
     "question": "这个知识库主要讲什么？",
-    "goal": "快速检查概览类问题是否还能稳定回答，不泄漏工具过程。",
+    "goal": "快速检查总览类问题是否还能稳定回答，不泄漏工具过程。",
     "expected_substrings": ["选购", "维护", "故障"],
     "min_hit_rate": 0.67,
     "forbidden_substrings": ["\"action\"", "rag_tool", "memory_tool", "我需要先从知识库检索"]
   },
   {
     "id": "selection_smoke_001",
-    "question": "扫地机器人适合大户型时，应重点关注哪些参数？",
+    "question": "扫地机器人适合大户型时，应该重点关注哪些参数？",
     "goal": "快速检查选购类回答是否还能命中大户型核心参数。",
-    "expected_substrings": ["大户型", "电池", "集尘"],
+    "expected_substrings": ["大户型", "续航", "集尘"],
     "min_hit_rate": 0.67,
     "forbidden_substrings": ["\"action\"", "rag_tool", "memory_tool", "我需要先从知识库检索"]
   },
   {
     "id": "app_smoke_001",
     "question": "APP 连不上扫地机器人时，通常应该检查什么？",
-    "goal": "快速检查故障排查类回答是否还包含网络、APP 和重启等关键信号。",
+    "goal": "快速检查连接类故障回答是否还包含网络、APP 和重启等关键信号。",
     "expected_substrings": ["网络", "APP", "重启"],
     "min_hit_rate": 0.67,
-    "forbidden_substrings": ["\"action\"", "rag_tool", "memory_tool", "我需要先从知识库检索"]
+    "forbidden_substrings": ["\"action\"", "rag_tool", "memory_tool", "我需要先从知识库检索", "回充", "充电座"]
+  },
+  {
+    "id": "wifi_smoke_001",
+    "question": "机器人无法连接WiFi",
+    "goal": "快速检查 WiFi 配网类问题不会再答成回充或其他无关故障。",
+    "expected_substrings": ["WiFi", "2.4G", "路由器"],
+    "min_hit_rate": 0.67,
+    "forbidden_substrings": ["\"action\"", "rag_tool", "memory_tool", "回充", "充电座", "出水"]
+  },
+  {
+    "id": "pause_smoke_001",
+    "question": "机器人清扫时频繁暂停怎么办？",
+    "goal": "快速检查暂停/停机类故障会走排障链路，并优先给出电量、尘盒、传感器等相关排查项。",
+    "expected_substrings": ["电量", "尘盒", "传感器"],
+    "min_hit_rate": 0.67,
+    "forbidden_substrings": ["\"action\"", "rag_tool", "memory_tool", "WiFi", "充电座", "出水", "拖布"]
   }
 ]

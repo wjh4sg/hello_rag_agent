@@ -15,6 +15,7 @@ DEFAULT_OUTPUT_DIR = EVAL_DIR / "results"
 DEFAULT_RETRIEVAL_CASES_PATH = EVAL_DIR / "retrieval_eval_cases.json"
 DEFAULT_MEMORY_CASES_PATH = EVAL_DIR / "memory_eval_cases.json"
 DEFAULT_SESSION_CASES_PATH = EVAL_DIR / "session_memory_eval_cases.json"
+DEFAULT_FUSION_CASES_PATH = EVAL_DIR / "fusion_eval_cases.json"
 DEFAULT_ANSWER_CASES_PATH = EVAL_DIR / "rag_eval_cases.json"
 DEFAULT_ANSWER_SMOKE_CASES_PATH = EVAL_DIR / "answer_smoke_eval_cases.json"
 
@@ -63,9 +64,12 @@ class RetrievalCase:
     goal: str
     expected_sources: tuple[str, ...]
     expected_keywords: tuple[str, ...]
+    expected_rewrite_substrings: tuple[str, ...]
+    forbidden_keywords: tuple[str, ...]
     top_k: int
     strategy: str | None
     min_keyword_hit_rate: float
+    max_first_hit_rank: int | None
 
 
 @dataclass(frozen=True)
@@ -105,11 +109,30 @@ class SessionCase:
 
 
 @dataclass(frozen=True)
+class FusionCase:
+    case_id: str
+    goal: str
+    user_id: str | None
+    turns: tuple[str, ...]
+    query: str
+    expected_memory_substrings: tuple[str, ...]
+    expected_query_substrings: tuple[str, ...]
+    expected_sources: tuple[str, ...]
+    expected_keywords: tuple[str, ...]
+    expected_answer_substrings: tuple[str, ...]
+    top_k: int
+    min_answer_hit_rate: float
+
+
+@dataclass(frozen=True)
 class AnswerCase:
     case_id: str
     question: str
     goal: str
     category: str
+    expected_substrings: tuple[str, ...]
+    min_hit_rate: float
+    forbidden_substrings: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -133,9 +156,12 @@ def load_retrieval_cases(path: Path) -> list[RetrievalCase]:
                 goal=str(item.get("goal", "")),
                 expected_sources=tuple(item.get("expected_sources", [])),
                 expected_keywords=tuple(item.get("expected_keywords", [])),
+                expected_rewrite_substrings=tuple(item.get("expected_rewrite_substrings", [])),
+                forbidden_keywords=tuple(item.get("forbidden_keywords", [])),
                 top_k=int(item.get("top_k", 4)),
                 strategy=str(item["strategy"]) if item.get("strategy") else None,
                 min_keyword_hit_rate=float(item.get("min_keyword_hit_rate", 0.5)),
+                max_first_hit_rank=int(item["max_first_hit_rank"]) if item.get("max_first_hit_rank") is not None else None,
             )
         )
     return cases
@@ -192,6 +218,29 @@ def load_session_cases(path: Path) -> list[SessionCase]:
     return cases
 
 
+def load_fusion_cases(path: Path) -> list[FusionCase]:
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    cases: list[FusionCase] = []
+    for item in raw:
+        cases.append(
+            FusionCase(
+                case_id=str(item["id"]),
+                goal=str(item.get("goal", "")),
+                user_id=str(item["user_id"]) if item.get("user_id") else None,
+                turns=tuple(str(turn) for turn in item.get("turns", [])),
+                query=str(item["query"]),
+                expected_memory_substrings=tuple(item.get("expected_memory_substrings", [])),
+                expected_query_substrings=tuple(item.get("expected_query_substrings", [])),
+                expected_sources=tuple(item.get("expected_sources", [])),
+                expected_keywords=tuple(item.get("expected_keywords", [])),
+                expected_answer_substrings=tuple(item.get("expected_answer_substrings", [])),
+                top_k=int(item.get("top_k", 4)),
+                min_answer_hit_rate=float(item.get("min_answer_hit_rate", 1.0)),
+            )
+        )
+    return cases
+
+
 def load_answer_cases(path: Path) -> list[AnswerCase]:
     raw = json.loads(path.read_text(encoding="utf-8"))
     cases: list[AnswerCase] = []
@@ -202,6 +251,9 @@ def load_answer_cases(path: Path) -> list[AnswerCase]:
                 question=str(item["question"]),
                 goal=str(item.get("goal", "")),
                 category=str(item.get("category", "rag_qa")),
+                expected_substrings=tuple(item.get("expected_substrings", [])),
+                min_hit_rate=float(item.get("min_hit_rate", 0.0)),
+                forbidden_substrings=tuple(item.get("forbidden_substrings", [])),
             )
         )
     return cases
@@ -278,6 +330,7 @@ def build_retrieval_suite(
     settings: AppSettings,
     cases_path: Path,
     default_top_k: int,
+    api_key: str,
     max_cases: int | None = None,
 ) -> dict[str, Any]:
     cases = load_retrieval_cases(cases_path)
@@ -285,7 +338,7 @@ def build_retrieval_suite(
         cases = cases[:max_cases]
     knowledge_base = KnowledgeBase(
         settings.knowledge_base,
-        api_key="",
+        api_key=api_key,
         base_url=settings.llm.base_url,
     )
     results: list[dict[str, Any]] = []
@@ -295,10 +348,42 @@ def build_retrieval_suite(
         evidence = knowledge_base.search(case.query, top_k=top_k, strategy=case.strategy)
         actual_sources = [item.chunk.source for item in evidence]
         combined_text = "\n".join(item.chunk.content for item in evidence)
+        snippet_text = "\n".join(item.snippet for item in evidence if item.snippet)
+        top1_text = ""
+        if evidence:
+            top1_text = (evidence[0].snippet or evidence[0].chunk.content).strip()
         matched_ranks = find_source_ranks(actual_sources, case.expected_sources)
         source_hit = bool(matched_ranks) if case.expected_sources else True
+        first_hit_rank = min(matched_ranks) if matched_ranks else None
+        rank_ok = case.max_first_hit_rank is None or (
+            first_hit_rank is not None and first_hit_rank <= case.max_first_hit_rank
+        )
         keyword_hit_rate = substring_hit_rate(combined_text, case.expected_keywords)
-        passed = source_hit and keyword_hit_rate >= case.min_keyword_hit_rate
+        snippet_keyword_hit_rate = substring_hit_rate(snippet_text, case.expected_keywords)
+        top1_keyword_hit_rate = substring_hit_rate(top1_text, case.expected_keywords)
+        trace = knowledge_base.get_last_search_trace()
+        rewritten_query = str(trace.get("rewritten_query", "")).strip()
+        rewrite_keywords = tuple(str(item) for item in trace.get("rewrite_keywords", []))
+        rewrite_mode = str(trace.get("rewrite_mode", "unknown"))
+        rewrite_text = "\n".join(filter(None, (rewritten_query, " ".join(rewrite_keywords))))
+        rewrite_hit_rate = substring_hit_rate(rewrite_text, case.expected_rewrite_substrings)
+        forbidden_hits = [
+            item for item in case.forbidden_keywords if item in combined_text or item in snippet_text
+        ]
+        top1_forbidden_hits = [item for item in case.forbidden_keywords if item in top1_text]
+        citation_coverage_rate = (
+            sum(1 for item in evidence if getattr(item, "citation", "").strip()) / len(evidence)
+            if evidence
+            else 0.0
+        )
+        source_diversity = (len(set(actual_sources)) / len(actual_sources)) if actual_sources else 0.0
+        passed = (
+            source_hit
+            and rank_ok
+            and keyword_hit_rate >= case.min_keyword_hit_rate
+            and (rewrite_hit_rate >= 1.0 if case.expected_rewrite_substrings else True)
+            and not forbidden_hits
+        )
 
         results.append(
             {
@@ -309,10 +394,24 @@ def build_retrieval_suite(
                 "strategy": case.strategy or settings.knowledge_base.retrieval_mode,
                 "expected_sources": list(case.expected_sources),
                 "expected_keywords": list(case.expected_keywords),
+                "expected_rewrite_substrings": list(case.expected_rewrite_substrings),
+                "forbidden_keywords": list(case.forbidden_keywords),
                 "actual_sources": actual_sources,
                 "source_hit": source_hit,
-                "first_hit_rank": min(matched_ranks) if matched_ranks else None,
+                "first_hit_rank": first_hit_rank,
+                "max_first_hit_rank": case.max_first_hit_rank,
+                "rank_ok": rank_ok,
                 "keyword_hit_rate": round(keyword_hit_rate, 4),
+                "snippet_keyword_hit_rate": round(snippet_keyword_hit_rate, 4),
+                "top1_keyword_hit_rate": round(top1_keyword_hit_rate, 4),
+                "rewritten_query": rewritten_query,
+                "rewrite_keywords": list(rewrite_keywords),
+                "rewrite_mode": rewrite_mode,
+                "rewrite_hit_rate": round(rewrite_hit_rate, 4),
+                "forbidden_hits": forbidden_hits,
+                "top1_forbidden_hits": top1_forbidden_hits,
+                "citation_coverage_rate": round(citation_coverage_rate, 4),
+                "source_diversity": round(source_diversity, 4),
                 "passed": passed,
             }
         )
@@ -323,7 +422,19 @@ def build_retrieval_suite(
         "case_count": len(results),
         "pass_rate": mean(1.0 if item["passed"] else 0.0 for item in results),
         "source_hit_rate": mean(1.0 if item["source_hit"] else 0.0 for item in results),
+        "rank_ok_rate": mean(1.0 if item["rank_ok"] else 0.0 for item in results),
         "avg_keyword_hit_rate": mean(item["keyword_hit_rate"] for item in results),
+        "avg_snippet_keyword_hit_rate": mean(item["snippet_keyword_hit_rate"] for item in results),
+        "avg_top1_keyword_hit_rate": mean(item["top1_keyword_hit_rate"] for item in results),
+        "avg_rewrite_hit_rate": mean(item["rewrite_hit_rate"] for item in results),
+        "forbidden_hit_rate": mean(1.0 if item["forbidden_hits"] else 0.0 for item in results),
+        "top1_forbidden_hit_rate": mean(1.0 if item["top1_forbidden_hits"] else 0.0 for item in results),
+        "avg_citation_coverage_rate": mean(item["citation_coverage_rate"] for item in results),
+        "avg_source_diversity": mean(item["source_diversity"] for item in results),
+        "rewrite_mode_counts": {
+            mode: sum(1 for item in results if item["rewrite_mode"] == mode)
+            for mode in sorted({item["rewrite_mode"] for item in results})
+        },
         "avg_first_hit_rank": round(mean(hit_ranks), 2) if hit_ranks else None,
     }
     return {"summary": summary, "cases": results}
@@ -467,6 +578,100 @@ def build_session_suite(
     return {"summary": summary, "cases": results}
 
 
+def build_fusion_suite(
+    *,
+    settings: AppSettings,
+    cases_path: Path,
+    api_key: str,
+    max_cases: int | None = None,
+) -> dict[str, Any]:
+    if not api_key:
+        return {
+            "summary": {
+                "suite": "fusion",
+                "skipped": True,
+                "reason": "未检测到可用 API Key，无法运行记忆-检索协同评测。",
+            },
+            "cases": [],
+        }
+
+    cases = load_fusion_cases(cases_path)
+    if max_cases is not None:
+        cases = cases[:max_cases]
+    service = HelloRagAgentService(settings=settings)
+    results: list[dict[str, Any]] = []
+
+    for case in cases:
+        session = service._get_or_create_session(user_id=case.user_id)
+        session_id = session.session_id
+        for turn in case.turns:
+            user_message = Message(content=turn, role="user")
+            ack_message = Message(content="收到，我会记住这条信息。", role="assistant")
+            session.history.extend([user_message, ack_message])
+            session.memory_tool.remember_message(user_message)
+            session.memory_tool.remember_message(ack_message)
+
+        memory_lines = service._collect_memory_lines(query=case.query, session=session)
+        search_query = service._build_search_query(query=case.query, memory_lines=memory_lines)
+        evidence = service._search_knowledge(query=case.query, search_query=search_query)
+        answer = service._answer_with_retrieval(case.query, session)
+
+        actual_sources = [item.chunk.source for item in evidence]
+        evidence_text = "\n".join(item.chunk.content for item in evidence)
+        matched_ranks = find_source_ranks(actual_sources, case.expected_sources)
+        memory_hit_rate = substring_hit_rate("\n".join(memory_lines), case.expected_memory_substrings)
+        query_hit_rate = substring_hit_rate(search_query, case.expected_query_substrings)
+        source_hit = bool(matched_ranks) if case.expected_sources else True
+        keyword_hit_rate = substring_hit_rate(evidence_text, case.expected_keywords)
+        answer_hit_rate = substring_hit_rate(answer, case.expected_answer_substrings)
+        trace_leak = contains_trace_markers(answer)
+        passed = (
+            memory_hit_rate >= 1.0
+            and query_hit_rate >= 1.0
+            and source_hit
+            and answer_hit_rate >= case.min_answer_hit_rate
+            and not trace_leak
+        )
+
+        results.append(
+            {
+                "id": case.case_id,
+                "goal": case.goal,
+                "user_id": case.user_id,
+                "query": case.query,
+                "memory_lines": memory_lines,
+                "search_query": search_query,
+                "actual_sources": actual_sources,
+                "expected_sources": list(case.expected_sources),
+                "memory_hit_rate": round(memory_hit_rate, 4),
+                "query_hit_rate": round(query_hit_rate, 4),
+                "source_hit": source_hit,
+                "first_hit_rank": min(matched_ranks) if matched_ranks else None,
+                "keyword_hit_rate": round(keyword_hit_rate, 4),
+                "answer_hit_rate": round(answer_hit_rate, 4),
+                "trace_leak": trace_leak,
+                "answer": answer,
+                "passed": passed,
+            }
+        )
+        service.reset_session(session_id)
+
+    hit_ranks = [item["first_hit_rank"] for item in results if item["first_hit_rank"] is not None]
+    summary = {
+        "suite": "fusion",
+        "case_count": len(results),
+        "pass_rate": mean(1.0 if item["passed"] else 0.0 for item in results),
+        "avg_memory_hit_rate": mean(item["memory_hit_rate"] for item in results),
+        "avg_query_hit_rate": mean(item["query_hit_rate"] for item in results),
+        "source_hit_rate": mean(1.0 if item["source_hit"] else 0.0 for item in results),
+        "avg_keyword_hit_rate": mean(item["keyword_hit_rate"] for item in results),
+        "avg_answer_hit_rate": mean(item["answer_hit_rate"] for item in results),
+        "trace_leak_rate": mean(1.0 if item["trace_leak"] else 0.0 for item in results),
+        "avg_first_hit_rank": round(mean(hit_ranks), 2) if hit_ranks else None,
+    }
+    return {"summary": summary, "cases": results}
+
+
 def build_answer_suite(
     *,
     settings: AppSettings,
@@ -515,8 +720,11 @@ def build_answer_suite(
             evidence=render_evidence(evidence_results),
         )
         payload = invoke_and_parse_judge(judge_llm=judge_llm, prompt=prompt)
+        hit_rate = substring_hit_rate(answer, case.expected_substrings)
         trace_leak = contains_trace_markers(answer)
-        passed = payload.get("verdict") == "pass" and not trace_leak
+        forbidden_hits = [item for item in case.forbidden_substrings if item in answer]
+        rule_pass = hit_rate >= case.min_hit_rate and not trace_leak and not forbidden_hits
+        passed = payload.get("verdict") == "pass" and rule_pass
         results.append(
             {
                 "id": case.case_id,
@@ -525,12 +733,19 @@ def build_answer_suite(
                 "goal": case.goal,
                 "session_id": session_id,
                 "answer": answer,
+                "expected_substrings": list(case.expected_substrings),
+                "substring_hit_rate": round(hit_rate, 4),
+                "min_hit_rate": case.min_hit_rate,
                 "trace_leak": trace_leak,
+                "forbidden_hits": forbidden_hits,
+                "rule_pass": rule_pass,
                 "evidence": [
                     {
                         "source": item.chunk.source,
                         "title": item.chunk.title,
                         "score": item.score,
+                        "citation": item.citation,
+                        "snippet": item.snippet,
                         "content": item.chunk.content,
                     }
                     for item in evidence_results
@@ -550,7 +765,10 @@ def build_answer_suite(
         "pass_rate": sum(verdict == "pass" for verdict in verdicts) / len(verdicts),
         "borderline_rate": sum(verdict == "borderline" for verdict in verdicts) / len(verdicts),
         "fail_rate": sum(verdict == "fail" for verdict in verdicts) / len(verdicts),
+        "rule_pass_rate": mean(1.0 if item["rule_pass"] else 0.0 for item in results),
+        "avg_substring_hit_rate": mean(item["substring_hit_rate"] for item in results),
         "trace_leak_rate": mean(1.0 if item["trace_leak"] else 0.0 for item in results),
+        "forbidden_hit_rate": mean(1.0 if item["forbidden_hits"] else 0.0 for item in results),
         "dimension_averages": {
             "groundedness": mean(item["judge"]["groundedness"] for item in results),
             "relevance": mean(item["judge"]["relevance"] for item in results),
@@ -687,7 +905,7 @@ def build_markdown_report(
 
 
 def parse_suites(raw: str) -> list[str]:
-    allowed = ("retrieval", "memory", "session", "answer", "answer_smoke")
+    allowed = ("retrieval", "memory", "session", "fusion", "answer", "answer_smoke")
     requested = [item.strip().lower() for item in raw.split(",") if item.strip()]
     invalid = [item for item in requested if item not in allowed]
     if invalid:
@@ -699,8 +917,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run the project evaluation suites.")
     parser.add_argument(
         "--suites",
-        default="retrieval,memory,session,answer",
-        help="Comma-separated suites: retrieval,memory,session,answer,answer_smoke",
+        default="retrieval,memory,session,fusion,answer",
+        help="Comma-separated suites: retrieval,memory,session,fusion,answer,answer_smoke",
     )
     parser.add_argument(
         "--profile",
@@ -718,6 +936,7 @@ def main() -> None:
     parser.add_argument("--retrieval-cases", type=Path, default=DEFAULT_RETRIEVAL_CASES_PATH)
     parser.add_argument("--memory-cases", type=Path, default=DEFAULT_MEMORY_CASES_PATH)
     parser.add_argument("--session-cases", type=Path, default=DEFAULT_SESSION_CASES_PATH)
+    parser.add_argument("--fusion-cases", type=Path, default=DEFAULT_FUSION_CASES_PATH)
     parser.add_argument("--answer-cases", type=Path, default=DEFAULT_ANSWER_CASES_PATH)
     parser.add_argument("--answer-smoke-cases", type=Path, default=DEFAULT_ANSWER_SMOKE_CASES_PATH)
     parser.add_argument("--judge-model", default=DEFAULT_JUDGE_MODEL)
@@ -728,7 +947,7 @@ def main() -> None:
     max_cases = args.max_cases
     if args.profile == "dev":
         if args.suites == parser.get_default("suites"):
-            requested_suites = ["retrieval", "memory", "session", "answer_smoke"]
+            requested_suites = ["retrieval", "memory", "session", "fusion", "answer_smoke"]
         if max_cases is None:
             max_cases = 2
     settings = load_settings()
@@ -740,6 +959,7 @@ def main() -> None:
             settings=settings,
             cases_path=args.retrieval_cases,
             default_top_k=args.top_k,
+            api_key=api_key,
             max_cases=max_cases,
         )
     if "memory" in requested_suites:
@@ -748,6 +968,13 @@ def main() -> None:
         suites["session"] = build_session_suite(
             settings=settings,
             cases_path=args.session_cases,
+            api_key=api_key,
+            max_cases=max_cases,
+        )
+    if "fusion" in requested_suites:
+        suites["fusion"] = build_fusion_suite(
+            settings=settings,
+            cases_path=args.fusion_cases,
             api_key=api_key,
             max_cases=max_cases,
         )

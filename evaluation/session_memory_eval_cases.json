@@ -55,5 +55,34 @@
     "top_k": 4,
     "min_answer_hit_rate": 1.0,
     "reload_service_before_recall": true
+  },
+  {
+    "id": "session_preference_update_001",
+    "goal": "验证用户偏好更新后，系统会优先记住新的当前偏好，而不是一直沿用旧偏好。",
+    "user_id": "eval_user_preference_update",
+    "turns": [
+      "一开始我更在意吸力。",
+      "不过现在我其实更在意静音。"
+    ],
+    "recall_query": "你还记得我现在更在意什么吗？",
+    "expected_memory_substrings": ["静音"],
+    "expected_answer_substrings": ["静音"],
+    "top_k": 3,
+    "min_answer_hit_rate": 1.0
+  },
+  {
+    "id": "session_cross_session_profile_001",
+    "goal": "验证重建服务后，用户画像仍可跨 session 继续参与回忆。",
+    "user_id": "eval_user_cross_session_profile",
+    "turns": [
+      "请记住，我家是木地板，养了一只长毛猫。",
+      "我更在意静音。"
+    ],
+    "recall_query": "你还记得我的家庭情况和偏好吗？",
+    "expected_memory_substrings": ["木地板", "长毛猫", "静音"],
+    "expected_answer_substrings": ["木地板", "长毛猫", "静音"],
+    "top_k": 4,
+    "min_answer_hit_rate": 1.0,
+    "reload_service_before_recall": true
   }
 ]

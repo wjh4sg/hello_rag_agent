@@ -13,25 +13,16 @@ ROOT_DIR = Path(__file__).resolve().parent
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="一键启动 Streamlit 和 FastAPI 服务。"
-    )
+    parser = argparse.ArgumentParser(description="一键启动 Streamlit 和 FastAPI 服务。")
     parser.add_argument("--host", default="127.0.0.1", help="FastAPI 监听地址")
     parser.add_argument("--api-port", type=int, default=8000, help="FastAPI 端口")
-    parser.add_argument(
-        "--streamlit-port",
-        type=int,
-        default=8501,
-        help="Streamlit 端口",
-    )
+    parser.add_argument("--streamlit-port", type=int, default=8501, help="Streamlit 端口")
     return parser.parse_args()
 
 
 def build_env() -> dict[str, str]:
     env = os.environ.copy()
     env.setdefault("PYTHONIOENCODING", "utf-8")
-    for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
-        env.pop(key, None)
     return env
 
 

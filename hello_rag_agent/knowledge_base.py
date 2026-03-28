@@ -4,6 +4,8 @@ from collections import Counter
 from dataclasses import dataclass, replace
 import hashlib
 import json
+import math
+import os
 from pathlib import Path
 import re
 from typing import Iterable
@@ -26,6 +28,7 @@ except ImportError:  # pragma: no cover
     PdfReader = None
 
 from hello_rag_agent.config import KnowledgeBaseSettings
+from hello_rag_agent.llm import SafeHelloAgentsLLM
 
 
 TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]")
@@ -37,6 +40,109 @@ SECTION_PRIORITY = {
     "bullet": 0.8,
     "qa": 1.1,
     "paragraph": 0.7,
+}
+GENERIC_REWRITE_STOPWORDS = {
+    "机器人",
+    "机器",
+    "问题",
+    "情况",
+    "一般",
+    "通常",
+    "需要",
+    "如何",
+    "什么",
+    "哪些",
+    "是否",
+    "可以",
+    "无法",
+    "出现",
+    "进行",
+    "根据",
+    "以及",
+    "当前",
+    "用户",
+    "知识库",
+    "检测",
+    "修复",
+    "故障现象",
+}
+
+MAX_CHINESE_TERM_NGRAM = 6
+GENERIC_FRAGMENT_STOPWORDS = {
+    "机器人",
+    "扫地机器人",
+    "扫拖一体机器人",
+    "扫拖一体",
+    "扫地",
+    "扫拖",
+    "拖一体",
+    "拖一",
+    "一体机",
+    "一体",
+    "体机器",
+    "地机",
+    "器人无",
+    "人无",
+    "法连",
+    "有哪",
+    "无法",
+    "一般",
+    "通常",
+    "应该",
+    "检查",
+    "哪些",
+    "什么",
+    "原因",
+    "时候",
+    "怎么",
+    "可能",
+}
+GENERIC_REWRITE_STOPWORDS = {
+    "机器人",
+    "扫地机器人",
+    "扫拖一体机器人",
+    "扫拖一体",
+    "机器",
+    "器人",
+    "问题",
+    "情况",
+    "一般",
+    "通常",
+    "需要",
+    "如何",
+    "什么",
+    "哪些",
+    "是否",
+    "可以",
+    "无法",
+    "出现",
+    "进行",
+    "根据",
+    "以及",
+    "当前",
+    "用户",
+    "知识库",
+    "检测",
+    "修复",
+    "检查",
+    "应该",
+    "原因",
+    "方式",
+    "步骤",
+    "可能",
+    "时候",
+    "怎么",
+    "故障",
+    "异常",
+    "排查",
+    "故障现象",
+    "故障排除",
+    "维护保养",
+    "选购指南",
+    "常见问题",
+    "问题及解答",
+    "常见问题及解答",
+    "新增",
 }
 
 
@@ -72,6 +178,14 @@ class _ChunkSegment:
     end_offset: int
 
 
+@dataclass(frozen=True)
+class QueryRewrite:
+    rewritten_query: str
+    keywords: tuple[str, ...]
+    intent: str
+    mode: str = "fallback"
+
+
 class KnowledgeBase:
     def __init__(
         self,
@@ -87,11 +201,16 @@ class KnowledgeBase:
         self._chunks_by_id: dict[str, KnowledgeChunk] = {}
         self._skipped_files: list[str] = []
         self._vector_error: str | None = None
-        self._embedding_client: OpenAI | None = None
+        self._openai_client: OpenAI | None = None
+        self._rewrite_llm: SafeHelloAgentsLLM | None = None
         self._client = None
         self._collection = None
+        self._rewrite_cache: dict[str, QueryRewrite] = {}
+        self._last_search_trace: dict[str, object] = {}
+        self._term_lexicon: dict[str, int] = {}
         self._collection_meta_path = self.settings.vector_store_dir / f"{self.settings.collection_name}_meta.json"
         self._load()
+        self._term_lexicon = self._build_term_lexicon()
         self._initialize_vector_store()
 
     def stats(self) -> dict[str, object]:
@@ -100,9 +219,16 @@ class KnowledgeBase:
             "document_count": len({chunk.source for chunk in self._chunks}),
             "chunk_count": len(self._chunks),
             "skipped_files": list(self._skipped_files),
+            "atomic_chunking_enabled": self.settings.atomic_chunking_enabled,
+            "atomic_chunk_max_chars": self.settings.atomic_chunk_max_chars,
             "retrieval_mode": self.settings.retrieval_mode,
             "rerank_pool_size": self.settings.rerank_pool_size,
+            "reranker_enabled": self.settings.reranker_enabled,
+            "reranker_semantic_weight": self.settings.reranker_semantic_weight,
             "max_query_variants": self.settings.max_query_variants,
+            "query_rewrite_enabled": self.settings.query_rewrite_enabled,
+            "query_rewrite_model": self.settings.query_rewrite_model,
+            "query_rewrite_max_keywords": self.settings.query_rewrite_max_keywords,
             "vector_store_dir": str(self.settings.vector_store_dir),
             "collection_name": self.settings.collection_name,
             "embedding_model": self.settings.embedding_model,
@@ -110,6 +236,9 @@ class KnowledgeBase:
             "vector_index_ready": self._collection is not None,
             "vector_error": self._vector_error,
         }
+
+    def get_last_search_trace(self) -> dict[str, object]:
+        return dict(self._last_search_trace)
 
     def search(
         self,
@@ -119,27 +248,67 @@ class KnowledgeBase:
     ) -> list[SearchResult]:
         normalized_query = query.strip()
         if not normalized_query:
+            self._last_search_trace = {
+                "original_query": query,
+                "rewritten_query": "",
+                "rewrite_keywords": [],
+                "rewrite_mode": "none",
+                "intent": "general",
+                "strategy": strategy or self.settings.retrieval_mode,
+                "results": [],
+            }
             return []
 
         limit = top_k or self.settings.top_k
-        if self._detect_query_intent(normalized_query) == "overview":
-            overview_results = self._overview_search(normalized_query, limit)
+        rewrite = self._rewrite_query(normalized_query)
+        rerank_query = rewrite.rewritten_query if rewrite and rewrite.rewritten_query else normalized_query
+        if rewrite and rewrite.keywords:
+            retrieval_query = self._expand_query_for_retrieval(
+                rerank_query,
+                extra_terms=rewrite.keywords,
+            )
+        elif self.settings.query_rewrite_enabled:
+            retrieval_query = rerank_query
+        else:
+            retrieval_query = self._expand_query_for_retrieval(rerank_query)
+        intent = self._detect_query_intent(rerank_query)
+        self._last_search_trace = {
+            "original_query": normalized_query,
+            "rewritten_query": rerank_query,
+            "retrieval_query": retrieval_query,
+            "rewrite_keywords": list(rewrite.keywords) if rewrite else [],
+            "rewrite_mode": rewrite.mode if rewrite else "none",
+            "intent": intent,
+            "strategy": strategy or self.settings.retrieval_mode,
+            "results": [],
+        }
+
+        if intent == "overview":
+            overview_results = self._overview_search(rerank_query, limit)
             if overview_results:
+                self._last_search_trace["results"] = [item.citation for item in overview_results]
                 return overview_results
 
-        retrieval_query = self._expand_query_for_retrieval(normalized_query)
         mode = self._normalize_retrieval_mode(strategy or self.settings.retrieval_mode)
         if mode == "keyword":
             results = self._keyword_search(retrieval_query, self._candidate_pool_size(limit))
-            return self._rerank_results(normalized_query, results, limit, strategy="keyword")
+            ranked = self._rerank_results(rerank_query, results, limit, strategy="keyword", rewrite=rewrite)
+            self._last_search_trace["results"] = [item.citation for item in ranked]
+            return ranked
         if mode == "vector":
             vector_results = self._vector_search(retrieval_query, self._candidate_pool_size(limit))
             if vector_results:
-                return self._rerank_results(normalized_query, vector_results, limit, strategy="vector")
+                ranked = self._rerank_results(rerank_query, vector_results, limit, strategy="vector", rewrite=rewrite)
+                self._last_search_trace["results"] = [item.citation for item in ranked]
+                return ranked
             keyword_results = self._keyword_search(retrieval_query, self._candidate_pool_size(limit))
-            return self._rerank_results(normalized_query, keyword_results, limit, strategy="keyword")
+            ranked = self._rerank_results(rerank_query, keyword_results, limit, strategy="keyword", rewrite=rewrite)
+            self._last_search_trace["results"] = [item.citation for item in ranked]
+            return ranked
 
-        return self._hybrid_search(retrieval_query, limit, rerank_query=normalized_query)
+        ranked = self._hybrid_search(retrieval_query, limit, rerank_query=rerank_query, rewrite=rewrite)
+        self._last_search_trace["results"] = [item.citation for item in ranked]
+        return ranked
 
     def render_context(
         self,
@@ -178,7 +347,7 @@ class KnowledgeBase:
         max_chars: int | None = None,
     ) -> tuple[str, tuple[str, ...]]:
         limit = max_chars or self.settings.snippet_max_chars
-        query_terms = self._tokenize(query)
+        query_terms = self._query_overlap_terms(query)
         match_terms = tuple(term for term in query_terms if term in chunk.content.lower() or term in chunk.title.lower())
 
         if not chunk.content:
@@ -296,16 +465,35 @@ class KnowledgeBase:
             }
         )
 
-    def _embed_texts(self, texts: list[str]) -> list[list[float]]:
-        if self._embedding_client is None:
-            http_client = httpx.Client(timeout=120, trust_env=False)
-            self._embedding_client = OpenAI(
+    @staticmethod
+    def _trust_env() -> bool:
+        raw = os.getenv("LLM_TRUST_ENV", "true").strip().lower()
+        return raw not in {"0", "false", "no", "off"}
+
+    def _get_openai_client(self) -> OpenAI:
+        if self._openai_client is None:
+            http_client = httpx.Client(timeout=120, trust_env=self._trust_env())
+            self._openai_client = OpenAI(
                 api_key=self.api_key,
                 base_url=self.base_url,
                 timeout=120,
                 http_client=http_client,
             )
+        return self._openai_client
 
+    def _get_rewrite_llm(self) -> SafeHelloAgentsLLM:
+        if self._rewrite_llm is None:
+            self._rewrite_llm = SafeHelloAgentsLLM(
+                model=self.settings.query_rewrite_model,
+                api_key=self.api_key,
+                base_url=self.base_url,
+                temperature=0.0,
+                max_tokens=220,
+                timeout=120,
+            )
+        return self._rewrite_llm
+
+    def _embed_texts(self, texts: list[str]) -> list[list[float]]:
         request: dict[str, object] = {
             "model": self.settings.embedding_model,
             "input": texts,
@@ -313,7 +501,7 @@ class KnowledgeBase:
         if self.settings.embedding_dimensions is not None:
             request["dimensions"] = self.settings.embedding_dimensions
 
-        response = self._embedding_client.embeddings.create(**request)
+        response = self._get_openai_client().embeddings.create(**request)
         return [item.embedding for item in sorted(response.data, key=lambda item: item.index)]
 
     def _load(self) -> None:
@@ -348,6 +536,99 @@ class KnowledgeBase:
                     self._chunks_by_id[chunk_id] = final_chunk
             except Exception:
                 self._skipped_files.append(f"failed:{file_path.name}")
+
+    def _build_term_lexicon(self) -> dict[str, int]:
+        counter: Counter[str] = Counter()
+        for chunk in self._chunks:
+            heading_text = " ".join(chunk.heading_path)
+            for term in self._iter_index_terms(chunk.content):
+                counter[term] += 1
+
+            for text, weight in ((chunk.title, 2), (heading_text, 2)):
+                for term in re.findall(r"[A-Za-z][A-Za-z0-9.+-]{1,}|[\u4e00-\u9fff]{2,12}", text):
+                    normalized = term.strip()
+                    if self._is_focus_term(normalized):
+                        counter[normalized] += weight
+        return {term: score for term, score in counter.items() if score >= 3}
+
+    def _iter_index_terms(self, text: str) -> list[str]:
+        terms: list[str] = []
+        seen: set[str] = set()
+
+        for term in re.findall(r"[A-Za-z][A-Za-z0-9.+-]{1,}", text):
+            normalized = term.strip()
+            lowered = normalized.lower()
+            if lowered in seen or not self._is_focus_term(normalized):
+                continue
+            seen.add(lowered)
+            terms.append(normalized)
+
+        for run in re.findall(r"[\u4e00-\u9fff]{2,16}", text):
+            max_size = min(MAX_CHINESE_TERM_NGRAM, len(run))
+            for size in range(max_size, 1, -1):
+                for start in range(0, len(run) - size + 1):
+                    term = run[start : start + size]
+                    key = f"zh:{term}"
+                    if key in seen or not self._is_focus_term(term):
+                        continue
+                    seen.add(key)
+                    terms.append(term)
+
+        return terms
+
+    @staticmethod
+    def _structured_intent_bonus(intent: str, chunk: KnowledgeChunk) -> float:
+        text = chunk.content
+        if intent == "troubleshooting" and any(marker in text for marker in ("检测：", "修复：", "怎么办")):
+            return 42.0
+        if intent == "maintenance" and any(marker in text for marker in ("清理", "更换", "维护", "保养")):
+            return 24.0
+        if intent == "selection" and any(marker in text for marker in ("选购", "参数", "推荐", "大户型", "续航", "水箱", "静音", "缠毛")):
+            return 28.0
+        return 0.0
+
+    @staticmethod
+    def _cross_intent_penalty(intent: str, chunk: KnowledgeChunk) -> float:
+        title = chunk.title
+        text = chunk.content
+        if intent == "selection":
+            if title == "故障排除":
+                return -140.0
+            if title == "维护保养":
+                return -40.0
+            if any(marker in text for marker in ("检测：", "修复：", "怎么办", "报警")):
+                return -110.0
+        if intent == "maintenance":
+            if title == "故障排除":
+                return -80.0
+            if any(marker in text for marker in ("检测：", "修复：")):
+                return -70.0
+        if intent == "troubleshooting":
+            if title == "选购指南":
+                return -100.0
+            if any(marker in text for marker in ("选购核心", "推荐", "适合")):
+                return -60.0
+        return 0.0
+
+    @staticmethod
+    def _is_focus_term(term: str) -> bool:
+        normalized = term.strip()
+        if not normalized or normalized.isdigit():
+            return False
+        if normalized in {"一次", "一般", "通常"}:
+            return False
+        lowered = normalized.lower()
+        if lowered in {item.lower() for item in (*GENERIC_REWRITE_STOPWORDS, *GENERIC_FRAGMENT_STOPWORDS)}:
+            return False
+        if re.fullmatch(r"[A-Za-z][A-Za-z0-9.+-]{1,}", normalized):
+            return len(normalized) >= 2
+        if not all("\u4e00" <= ch <= "\u9fff" for ch in normalized):
+            return False
+        if not 2 <= len(normalized) <= MAX_CHINESE_TERM_NGRAM:
+            return False
+        if normalized.endswith(("问题", "情况", "方式", "步骤", "时候")):
+            return False
+        return True
 
     def _build_chunks(self, source: str, title: str, text: str) -> list[KnowledgeChunk]:
         normalized = self._normalize_document_text(text)
@@ -405,6 +686,29 @@ class KnowledgeBase:
             buffer_len = sum(len(segment.text) + 1 for segment in buffer)
 
         for segment in segments:
+            if self._should_keep_atomic_segment(segment):
+                if buffer:
+                    flush_buffer()
+                    buffer = []
+                    buffer_len = 0
+
+                content = segment.text.strip()
+                if content:
+                    chunks.append(
+                        KnowledgeChunk(
+                            chunk_id=f"{source}-{len(chunks) + 1}",
+                            source=source,
+                            title=title,
+                            content=content,
+                            chunk_index=len(chunks) + 1,
+                            heading_path=segment.heading_path or (title,),
+                            section_type=segment.section_type,
+                            start_offset=segment.start_offset,
+                            end_offset=segment.end_offset,
+                        )
+                    )
+                continue
+
             if buffer:
                 heading_changed = segment.heading_path != buffer[-1].heading_path
                 if heading_changed and buffer_len >= chunk_size // 3:
@@ -428,6 +732,21 @@ class KnowledgeBase:
 
         flush_buffer()
         return chunks
+
+    def _should_keep_atomic_segment(self, segment: _ChunkSegment) -> bool:
+        if not self.settings.atomic_chunking_enabled:
+            return False
+        text = segment.text.strip()
+        if not text:
+            return False
+        if len(text) > self.settings.atomic_chunk_max_chars:
+            return False
+        if segment.section_type not in {"bullet", "qa"}:
+            return False
+        if re.match(r"^\d+[.)、．]\s*", text):
+            return True
+        delimiter_count = text.count("；") + text.count(";") + text.count("：") + text.count(":")
+        return delimiter_count >= 2
 
     def _iter_files(self, root: Path) -> Iterable[Path]:
         for path in root.rglob("*"):
@@ -454,7 +773,8 @@ class KnowledgeBase:
         normalized = re.sub(r"\r\n?", "\n", text)
         normalized = re.sub(r"(?<!\n)(#{1,6}\s+)", r"\n\1", normalized)
         normalized = re.sub(r"(?<!\n)(\d+\.\s*\*\*[^*]{2,80}\*\*)", r"\n\1", normalized)
-        normalized = re.sub(r"(?<!\n)(\d+[、.]\s*[^\n]{2,40}[:：])", r"\n\1", normalized)
+        normalized = re.sub(r"(?<!\n)(\d+[、.]\s+)", r"\n\1", normalized)
+        normalized = re.sub(r"(?<!\n)(-\s+)", r"\n\1", normalized)
         normalized = re.sub(r"\n{3,}", "\n\n", normalized)
         return normalized.strip()
 
@@ -658,12 +978,19 @@ class KnowledgeBase:
             ranked.append((chunk, self._distance_to_score(distance)))
         return ranked[:limit]
 
-    def _hybrid_search(self, query: str, limit: int, *, rerank_query: str | None = None) -> list[SearchResult]:
+    def _hybrid_search(
+        self,
+        query: str,
+        limit: int,
+        *,
+        rerank_query: str | None = None,
+        rewrite: QueryRewrite | None = None,
+    ) -> list[SearchResult]:
         pool_size = self._candidate_pool_size(limit)
         keyword_results = self._keyword_search(query, pool_size)
         vector_results = self._vector_search(query, pool_size)
         if not vector_results:
-            return self._rerank_results(rerank_query or query, keyword_results, limit, strategy="keyword")
+            return self._rerank_results(rerank_query or query, keyword_results, limit, strategy="keyword", rewrite=rewrite)
 
         combined_scores: dict[str, dict[str, float | str]] = {}
         for strategy_name, ranking in (("keyword", keyword_results), ("vector", vector_results)):
@@ -688,7 +1015,7 @@ class KnowledgeBase:
             if chunk_id in self._chunks_by_id
         ]
         merged.sort(key=lambda item: item[1], reverse=True)
-        return self._rerank_results(rerank_query or query, merged[:pool_size], limit, strategy="hybrid")
+        return self._rerank_results(rerank_query or query, merged[:pool_size], limit, strategy="hybrid", rewrite=rewrite)
 
     def _rerank_results(
         self,
@@ -697,23 +1024,34 @@ class KnowledgeBase:
         limit: int,
         *,
         strategy: str,
+        rewrite: QueryRewrite | None = None,
     ) -> list[SearchResult]:
-        query_terms = self._tokenize(query)
+        query_terms = self._query_overlap_terms(query, rewrite)
+        rewrite_terms = list(rewrite.keywords) if rewrite and rewrite.keywords else list(self._extract_rewrite_keywords(query, limit=4))
         same_doc_hits = Counter(chunk.source for chunk, _ in candidates)
         intent = self._detect_query_intent(query)
+        semantic_scores = self._semantic_rerank_scores(query, candidates)
         ranked: list[tuple[float, KnowledgeChunk]] = []
         for rank, (chunk, base_score) in enumerate(candidates, start=1):
             text = f"{chunk.title}\n{chunk.content}"
             lexical = self._score_text_overlap(query_terms, text)
-            phrase_bonus = 1.2 if query.strip().lower() in text.lower() else 0.0
+            phrase_bonus = 180.0 if query.strip().lower() in text.lower() else 0.0
             heading_bonus = 0.6 * self._score_text_overlap(query_terms, " ".join(chunk.heading_path))
             section_bonus = SECTION_PRIORITY.get(chunk.section_type, 0.0)
             density_bonus = min(same_doc_hits.get(chunk.source, 0), 3) * 0.2
             rank_bonus = max(limit + 2 - rank, 0) * 0.08
             source_bonus = self._source_preference_bonus(chunk.source)
             intent_bonus = self._intent_relevance_bonus(intent, chunk)
+            structured_bonus = self._structured_intent_bonus(intent, chunk)
+            cross_intent_penalty = self._cross_intent_penalty(intent, chunk)
+            focus_bonus = self._focus_keyword_bonus(chunk, rewrite_terms)
+            focus_penalty = self._focus_miss_penalty(chunk, rewrite_terms)
+            topic_bonus = self._topic_hint_bonus(query, intent, chunk, rewrite_terms)
+            topic_penalty = self._topic_miss_penalty(query, intent, chunk, rewrite_terms)
+            semantic_bonus = semantic_scores.get(chunk.chunk_id, 0.0) * (120.0 * self.settings.reranker_semantic_weight)
+            base_signal = math.log1p(max(base_score, 0.0)) * 35.0
             final_score = (
-                base_score * 100.0
+                base_signal
                 + lexical * 4.0
                 + phrase_bonus
                 + heading_bonus
@@ -722,6 +1060,13 @@ class KnowledgeBase:
                 + rank_bonus
                 + source_bonus
                 + intent_bonus
+                + structured_bonus
+                + cross_intent_penalty
+                + focus_bonus
+                + focus_penalty
+                + topic_bonus
+                + topic_penalty
+                + semantic_bonus
             )
             ranked.append((final_score, chunk))
 
@@ -803,11 +1148,24 @@ class KnowledgeBase:
 
         intent = self._detect_query_intent(query)
         max_per_source = 1 if intent == "overview" else 2
-        if "app" in query.lower():
+        lowered_query = query.lower()
+        if any(marker in lowered_query for marker in ("app", "wifi", "2.4g", "路由", "配网", "绑定")):
             max_per_source = 1
         source_counts: dict[str, int] = {}
         selected: list[SearchResult] = []
         deferred: list[SearchResult] = []
+        if intent == "maintenance":
+            covered_components: set[str] = set()
+            maintenance_first: list[SearchResult] = []
+            for item in results:
+                components = self._maintenance_components_for_result(query, item)
+                if components and not components.issubset(covered_components):
+                    maintenance_first.append(item)
+                    covered_components.update(components)
+                else:
+                    deferred.append(item)
+            results = maintenance_first + deferred
+            deferred = []
         for item in results:
             current = source_counts.get(item.chunk.source, 0)
             if current >= max_per_source:
@@ -824,14 +1182,235 @@ class KnowledgeBase:
                 break
         return selected
 
+    @staticmethod
+    def _maintenance_components_for_result(query: str, item: SearchResult) -> set[str]:
+        requested: list[tuple[str, tuple[str, ...]]] = [
+            ("滚刷", ("滚刷", "主刷")),
+            ("边刷", ("边刷",)),
+            ("滤网", ("滤网",)),
+        ]
+        text = f"{item.chunk.title}\n{' '.join(item.chunk.heading_path)}\n{item.chunk.content}"
+        hits: set[str] = set()
+        for label, aliases in requested:
+            if label not in query:
+                continue
+            if any(alias in text for alias in aliases):
+                hits.add(label)
+        return hits
+
     def _candidate_pool_size(self, limit: int) -> int:
         return max(limit, self.settings.rerank_pool_size, self.settings.top_k * 2)
 
-    def _expand_query_for_retrieval(self, query: str) -> str:
-        expansions = list(self._intent_expansion_terms(query))
+    def _expand_query_for_retrieval(self, query: str, *, extra_terms: tuple[str, ...] = ()) -> str:
+        expansions = list(extra_terms) if extra_terms else list(self._intent_expansion_terms(query))
         if not expansions:
             return query
-        return f"{query} {' '.join(expansions[:4])}"
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for item in expansions:
+            normalized = item.strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            deduped.append(normalized)
+            if len(deduped) >= self.settings.query_rewrite_max_keywords:
+                break
+        if not deduped:
+            return query
+        return f"{query} {' '.join(deduped)}"
+
+    def _rewrite_query(self, query: str) -> QueryRewrite | None:
+        fallback = self._fallback_rewrite_query(query)
+        if not self.settings.query_rewrite_enabled:
+            return fallback
+        if not self.api_key:
+            return fallback
+        cached = self._rewrite_cache.get(query)
+        if cached is not None:
+            return cached
+
+        prompt = (
+            "你是检索查询改写器。请把用户问题改写成更适合知识库检索的短查询，并提取 3 到 6 个核心关键词。"
+            "不要引入原问题没有提到的其他故障主题或产品主题。"
+            "请只返回 JSON，格式为 "
+            '{"rewritten_query":"...", "keywords":["..."], "intent":"..."}。'
+        )
+        try:
+            response = self._get_rewrite_llm().invoke(
+                messages=[
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": query},
+                ],
+            )
+            raw_content = (response.content or "").strip()
+            payload = self._parse_rewrite_payload(raw_content)
+            if payload is None:
+                self._rewrite_cache[query] = fallback
+                return fallback
+            rewritten_query = str(payload.get("rewritten_query", "")).strip() or query
+            keywords = tuple(
+                keyword.strip()
+                for keyword in payload.get("keywords", [])
+                if isinstance(keyword, str) and keyword.strip()
+            )[: self.settings.query_rewrite_max_keywords]
+            intent = str(payload.get("intent", "")).strip() or self._detect_query_intent(query)
+            rewrite = QueryRewrite(
+                rewritten_query=rewritten_query,
+                keywords=keywords,
+                intent=intent,
+            )
+            self._rewrite_cache[query] = rewrite
+            return rewrite
+        except Exception:
+            self._rewrite_cache[query] = fallback
+            return fallback
+
+    @staticmethod
+    def _parse_rewrite_payload(raw_content: str) -> dict[str, object] | None:
+        if not raw_content:
+            return None
+        try:
+            return json.loads(raw_content)
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", raw_content, flags=re.DOTALL)
+            if not match:
+                return None
+            try:
+                return json.loads(match.group(0))
+            except json.JSONDecodeError:
+                return None
+
+    def _fallback_rewrite_query(self, query: str) -> QueryRewrite:
+        keywords = self._extract_rewrite_keywords(query)
+        return QueryRewrite(
+            rewritten_query=query,
+            keywords=keywords,
+            intent=self._detect_query_intent(query),
+        )
+
+    def _extract_rewrite_keywords(self, query: str, *, limit: int | None = None) -> tuple[str, ...]:
+        target_limit = limit or self.settings.query_rewrite_max_keywords
+        query_lower = query.lower()
+        direct_matches = [
+            term
+            for term, score in sorted(self._term_lexicon.items(), key=lambda item: (-len(item[0]), -item[1]))
+            if term.lower() in query_lower
+        ]
+        keywords: list[str] = []
+        for term in direct_matches:
+            if not any(term in existing or existing in term for existing in keywords):
+                keywords.append(term)
+            if len(keywords) >= target_limit:
+                return tuple(keywords)
+
+        if not keywords:
+            return ()
+
+        related_counts: Counter[str] = Counter()
+        scored_candidates = self._keyword_search(query, min(max(self.settings.top_k * 2, 6), len(self._chunks) or 1))
+        for chunk, _ in scored_candidates[:6]:
+            text = f"{chunk.title}\n{' '.join(chunk.heading_path)}\n{chunk.content}"
+            lowered_text = text.lower()
+            if not any(term.lower() in lowered_text for term in keywords):
+                continue
+            for term, score in self._term_lexicon.items():
+                lowered_term = term.lower()
+                if lowered_term in query_lower or lowered_term in {item.lower() for item in keywords}:
+                    continue
+                if lowered_term in lowered_text:
+                    related_counts[term] += score
+
+        for term, _ in related_counts.most_common(target_limit * 2):
+            if term not in keywords:
+                keywords.append(term)
+            if len(keywords) >= target_limit:
+                break
+        return tuple(keywords[:target_limit])
+
+    def _semantic_rerank_scores(
+        self,
+        query: str,
+        candidates: list[tuple[KnowledgeChunk, float]],
+    ) -> dict[str, float]:
+        if not self.settings.reranker_enabled or not self.api_key or not candidates:
+            return {}
+        texts = [query, *[self._candidate_rerank_text(chunk) for chunk, _ in candidates]]
+        try:
+            embeddings = self._embed_texts(texts)
+        except Exception:
+            return {}
+        if len(embeddings) != len(texts):
+            return {}
+        query_embedding = embeddings[0]
+        scores: dict[str, float] = {}
+        for (chunk, _), candidate_embedding in zip(candidates, embeddings[1:]):
+            scores[chunk.chunk_id] = self._cosine_similarity(query_embedding, candidate_embedding)
+        return scores
+
+    @staticmethod
+    def _candidate_rerank_text(chunk: KnowledgeChunk) -> str:
+        heading = " > ".join(chunk.heading_path)
+        return f"{chunk.title}\n{heading}\n{chunk.content}"
+
+    @staticmethod
+    def _cosine_similarity(left: list[float], right: list[float]) -> float:
+        if not left or not right or len(left) != len(right):
+            return 0.0
+        numerator = sum(a * b for a, b in zip(left, right))
+        left_norm = math.sqrt(sum(a * a for a in left))
+        right_norm = math.sqrt(sum(b * b for b in right))
+        if left_norm == 0.0 or right_norm == 0.0:
+            return 0.0
+        return numerator / (left_norm * right_norm)
+
+    def _focus_keyword_bonus(self, chunk: KnowledgeChunk, keywords: list[str]) -> float:
+        if not keywords:
+            return 0.0
+        text = f"{chunk.title}\n{' '.join(chunk.heading_path)}\n{chunk.content}".lower()
+        hits = sum(1 for keyword in keywords if keyword.lower() in text)
+        if hits == 0:
+            return 0.0
+        coverage = hits / max(len(keywords), 1)
+        return 36.0 * coverage
+
+    def _focus_miss_penalty(self, chunk: KnowledgeChunk, keywords: list[str]) -> float:
+        if not keywords:
+            return 0.0
+        text = f"{chunk.title}\n{' '.join(chunk.heading_path)}\n{chunk.content}".lower()
+        if any(keyword.lower() in text for keyword in keywords):
+            return 0.0
+        return -18.0
+
+    @staticmethod
+    def _structured_intent_bonus(intent: str, chunk: KnowledgeChunk) -> float:
+        text = chunk.content
+        if intent == "troubleshooting" and "检测" in text and "修复" in text:
+            return 36.0
+        if intent == "maintenance" and any(marker in text for marker in ("清理", "更换", "维护", "保养")):
+            return 20.0
+        if intent == "selection" and any(marker in text for marker in ("参数", "选购", "适合", "推荐")):
+            return 20.0
+        return 0.0
+
+    @staticmethod
+    def _cross_intent_penalty(intent: str, chunk: KnowledgeChunk) -> float:
+        title = chunk.title
+        if intent == "troubleshooting":
+            if title == "维护保养":
+                return -80.0
+            if title == "选购指南":
+                return -100.0
+        if intent == "maintenance":
+            if title == "故障排除":
+                return -50.0
+            if title == "选购指南":
+                return -20.0
+        if intent == "selection":
+            if title == "故障排除":
+                return -80.0
+            if title == "维护保养":
+                return -20.0
+        return 0.0
 
     def _overview_search(self, query: str, limit: int) -> list[SearchResult]:
         preferred_titles = ("选购指南", "维护保养", "故障排除")
@@ -854,6 +1433,8 @@ class KnowledgeBase:
         digest = hashlib.sha256()
         digest.update(self.settings.embedding_model.encode("utf-8"))
         digest.update(str(self.settings.embedding_dimensions).encode("utf-8"))
+        digest.update(str(self.settings.atomic_chunking_enabled).encode("utf-8"))
+        digest.update(str(self.settings.atomic_chunk_max_chars).encode("utf-8"))
         for chunk in self._chunks:
             digest.update(chunk.chunk_id.encode("utf-8"))
             digest.update(chunk.content.encode("utf-8"))
@@ -898,12 +1479,571 @@ class KnowledgeBase:
             return ("选购", "维护", "故障")
         return ()
 
+    def _should_keep_atomic_segment(self, segment: _ChunkSegment) -> bool:
+        if not self.settings.atomic_chunking_enabled:
+            return False
+        text = segment.text.strip()
+        if not text:
+            return False
+        if len(text) > self.settings.atomic_chunk_max_chars:
+            return False
+        return segment.section_type in {"bullet", "qa"}
+
+    @staticmethod
+    def _normalize_document_text(text: str) -> str:
+        normalized = re.sub(r"\r\n?", "\n", text)
+        normalized = re.sub(r"(?<!\n)(#{1,6}\s+)", r"\n\1", normalized)
+        normalized = re.sub(r"(?<!\n)(\d+\.\s*\*\*[^*]{2,80}\*\*)", r"\n\1", normalized)
+        normalized = re.sub(r"(?<!\n)(\d+[、.]\s+)", r"\n\1", normalized)
+        normalized = re.sub(r"(?<!\n)(-\s+)", r"\n\1", normalized)
+        normalized = re.sub(r"\n{3,}", "\n\n", normalized)
+        return normalized.strip()
+
+    def _segment_text(self, text: str, title: str) -> list[_ChunkSegment]:
+        lines = text.splitlines()
+        heading_stack: list[str] = [title]
+        segments: list[_ChunkSegment] = []
+        buffer: list[str] = []
+        buffer_type = "paragraph"
+        buffer_heading = tuple(heading_stack)
+        offset = 0
+        segment_start = 0
+
+        def flush() -> None:
+            nonlocal buffer, segment_start
+            if not buffer:
+                return
+            segment_text = "\n".join(buffer).strip()
+            if segment_text:
+                segments.append(
+                    _ChunkSegment(
+                        text=segment_text,
+                        heading_path=buffer_heading,
+                        section_type=buffer_type,
+                        start_offset=segment_start,
+                        end_offset=segment_start + len(segment_text),
+                    )
+                )
+            buffer = []
+
+        for raw_line in lines:
+            line = raw_line.strip()
+            line_start = offset
+            offset += len(raw_line) + 1
+
+            if not line or self._is_noise_line(line):
+                flush()
+                continue
+
+            heading_info = self._parse_heading(line)
+            if heading_info is not None:
+                flush()
+                level, heading = heading_info
+                level = max(level, 1)
+                while len(heading_stack) > level:
+                    heading_stack.pop()
+                if len(heading_stack) == level:
+                    heading_stack[-1] = heading
+                else:
+                    heading_stack.append(heading)
+                continue
+
+            line_type = self._detect_section_type(line)
+            current_heading = tuple(heading_stack)
+            if line_type in {"bullet", "qa"}:
+                flush()
+                segments.append(
+                    _ChunkSegment(
+                        text=line,
+                        heading_path=current_heading,
+                        section_type=line_type,
+                        start_offset=line_start,
+                        end_offset=line_start + len(line),
+                    )
+                )
+                continue
+
+            if not buffer:
+                buffer_heading = current_heading
+                buffer_type = line_type
+                segment_start = line_start
+            elif buffer_heading != current_heading:
+                flush()
+                buffer_heading = current_heading
+                buffer_type = line_type
+                segment_start = line_start
+
+            buffer.append(line)
+
+        flush()
+        return segments
+
+    @staticmethod
+    def _is_noise_line(line: str) -> bool:
+        if line in {"#", "##", "###"}:
+            return True
+        if re.fullmatch(r"\d+[.]?", line):
+            return True
+        if re.fullmatch(r"[-*#=]{2,}", line):
+            return True
+        return False
+
+    @staticmethod
+    def _parse_heading(line: str) -> tuple[int, str] | None:
+        markdown_match = re.match(r"^(#{1,6})\s+(.*)$", line)
+        if markdown_match:
+            title = markdown_match.group(2).strip(" -*")
+            return len(markdown_match.group(1)), title or "Untitled"
+
+        numbered_match = re.match(r"^(\d+(?:\.\d+)*)(?:[、.]|\))\s*(.+)$", line)
+        if numbered_match and len(line) <= 36:
+            level = min(len(numbered_match.group(1).split(".")) + 1, 4)
+            return level, numbered_match.group(2).strip(" :：")
+
+        catalog_heading = re.match(r"^.{4,40}(?:选购指南|维护保养|故障检测与修复|常见问题及解答).{0,10}$", line)
+        if catalog_heading:
+            return 1, line.strip(" #")
+
+        colon_heading = re.match(r"^([^:：]{2,30})[:：]$", line)
+        if colon_heading:
+            return 2, colon_heading.group(1).strip()
+
+        return None
+
+    @staticmethod
+    def _detect_section_type(line: str) -> str:
+        if re.match(r"^[-*•]\s+", line):
+            return "bullet"
+        if re.match(r"^\d+(?:[.)、]|\s)\s*", line):
+            return "bullet"
+        if "**" in line and ("?" in line or "？" in line):
+            return "qa"
+        if any(marker in line for marker in ("如何", "为什么", "怎么", "是否", "吗", "？")) and len(line) <= 80:
+            return "qa"
+        return "paragraph"
+
+    @staticmethod
+    def _detect_query_intent(query: str) -> str:
+        normalized = query.strip()
+        if not normalized:
+            return "general"
+        if any(marker in normalized for marker in ("知识库", "主要讲什么", "主要内容", "讲什么")):
+            return "overview"
+        if any(marker in normalized for marker in ("选购", "推荐", "适合", "参数", "大户型")):
+            return "selection"
+        if any(marker in normalized for marker in ("维护", "保养", "多久", "更换", "清理")):
+            return "maintenance"
+        if any(marker in normalized for marker in ("故障", "异常", "回充", "出水", "排查", "无法", "报警", "APP", "WiFi")):
+            return "troubleshooting"
+        return "general"
+
+    @staticmethod
+    def _intent_relevance_bonus(intent: str, chunk: KnowledgeChunk) -> float:
+        title = chunk.title
+        if intent == "selection":
+            if title == "选购指南":
+                return 180.0
+            if "选购指南" in title:
+                return 60.0
+            if "故障排除" in title:
+                return -6.0
+        if intent == "maintenance":
+            if title == "维护保养":
+                return 180.0
+            if "维护保养" in title:
+                return 60.0
+            if "选购指南" in title:
+                return -4.0
+        if intent == "troubleshooting":
+            if title == "故障排除":
+                return 180.0
+            if "故障排除" in title:
+                return 60.0
+            if "选购指南" in title:
+                return -6.0
+            if chunk.section_type == "qa":
+                return 6.0
+        if intent == "overview" and title in {"选购指南", "维护保养", "故障排除"}:
+            return 120.0
+        return 0.0
+
+    @staticmethod
+    def _intent_expansion_terms(query: str) -> tuple[str, ...]:
+        intent = KnowledgeBase._detect_query_intent(query)
+        if intent == "selection":
+            return ("选购", "参数", "续航", "断点续扫", "水箱", "大户型")
+        if intent == "maintenance":
+            return ("维护", "保养", "滚刷", "边刷", "滤网", "更换")
+        if intent == "overview":
+            return ("选购", "维护", "故障")
+        return ()
+
+    def _rewrite_query(self, query: str) -> QueryRewrite | None:
+        fallback = self._fallback_rewrite_query(query)
+        if not self.settings.query_rewrite_enabled:
+            return fallback
+        if not self.api_key:
+            return fallback
+        cached = self._rewrite_cache.get(query)
+        if cached is not None:
+            return cached
+
+        prompt = (
+            "你是检索查询改写器。请把用户问题改写成更适合知识库检索的短查询，"
+            "并提取 3 到 6 个核心关键词。不要引入原问题没有提到的其他故障主题。"
+            "只返回 JSON，格式为 "
+            '{"rewritten_query":"...", "keywords":["..."], "intent":"..."}。'
+        )
+        try:
+            response = self._get_rewrite_llm().invoke(
+                messages=[
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": query},
+                ],
+            )
+            raw_content = (response.content or "").strip()
+            payload = self._parse_rewrite_payload(raw_content)
+            if payload is None:
+                self._rewrite_cache[query] = fallback
+                return fallback
+            rewritten_query = str(payload.get("rewritten_query", "")).strip() or query
+            keywords = tuple(
+                keyword.strip()
+                for keyword in payload.get("keywords", [])
+                if isinstance(keyword, str) and keyword.strip()
+            )[: self.settings.query_rewrite_max_keywords]
+            intent = str(payload.get("intent", "")).strip() or self._detect_query_intent(query)
+            rewrite = QueryRewrite(
+                rewritten_query=rewritten_query,
+                keywords=keywords,
+                intent=intent,
+                mode="llm",
+            )
+            self._rewrite_cache[query] = rewrite
+            return rewrite
+        except Exception:
+            self._rewrite_cache[query] = fallback
+            return fallback
+
+    def _fallback_rewrite_query(self, query: str) -> QueryRewrite:
+        return QueryRewrite(
+            rewritten_query=query,
+            keywords=self._extract_rewrite_keywords(query),
+            intent=self._detect_query_intent(query),
+            mode="fallback",
+        )
+
+    def _extract_rewrite_keywords(self, query: str, *, limit: int | None = None) -> tuple[str, ...]:
+        target_limit = limit or self.settings.query_rewrite_max_keywords
+        keywords: list[str] = []
+
+        for term in self._query_anchor_terms(query):
+            if term.lower() not in {item.lower() for item in keywords}:
+                keywords.append(term)
+            if len(keywords) >= target_limit:
+                return tuple(keywords[:target_limit])
+
+        for term in re.findall(r"[A-Za-z][A-Za-z0-9.+-]{1,}", query):
+            if not self._is_focus_term(term):
+                continue
+            if term.lower() not in {item.lower() for item in keywords}:
+                keywords.append(term)
+            if len(keywords) >= target_limit:
+                return tuple(keywords)
+
+        candidates: list[tuple[str, int]] = []
+        for match in re.finditer(r"[\u4e00-\u9fff]{2,16}", query):
+            run = match.group(0)
+            max_size = min(MAX_CHINESE_TERM_NGRAM, len(run))
+            for size in range(max_size, 1, -1):
+                for start in range(0, len(run) - size + 1):
+                    term = run[start : start + size]
+                    if not self._is_focus_term(term):
+                        continue
+                    score = self._term_lexicon.get(term, 0)
+                    if score <= 0:
+                        continue
+                    candidates.append((term, score))
+
+        for term, _ in sorted(candidates, key=lambda item: (-len(item[0]), -item[1], query.find(item[0]))):
+            lowered = term.lower()
+            if lowered in {item.lower() for item in keywords}:
+                continue
+            if any(lowered in existing.lower() or existing.lower() in lowered for existing in keywords):
+                continue
+            keywords.append(term)
+            if len(keywords) >= target_limit:
+                break
+
+        return tuple(keywords[:target_limit])
+
+    @staticmethod
+    def _structured_intent_bonus(intent: str, chunk: KnowledgeChunk) -> float:
+        text = chunk.content
+        if intent == "troubleshooting" and "检测" in text and "修复" in text:
+            return 36.0
+        if intent == "maintenance" and any(marker in text for marker in ("清理", "更换", "维护", "保养")):
+            return 20.0
+        if intent == "selection" and any(marker in text for marker in ("参数", "选购", "适合", "推荐")):
+            return 20.0
+        return 0.0
+
+    @staticmethod
+    def _cross_intent_penalty(intent: str, chunk: KnowledgeChunk) -> float:
+        title = chunk.title
+        if intent == "troubleshooting":
+            if title == "维护保养":
+                return -80.0
+            if title == "选购指南":
+                return -100.0
+        if intent == "maintenance":
+            if title == "故障排除":
+                return -50.0
+            if title == "选购指南":
+                return -20.0
+        if intent == "selection":
+            if title == "故障排除":
+                return -80.0
+            if title == "维护保养":
+                return -20.0
+        return 0.0
+
+    @staticmethod
+    def _is_focus_term(term: str) -> bool:
+        normalized = term.strip()
+        if not normalized or normalized.isdigit():
+            return False
+        lowered = normalized.lower()
+        if lowered in {item.lower() for item in GENERIC_REWRITE_STOPWORDS}:
+            return False
+        if re.fullmatch(r"[A-Za-z][A-Za-z0-9.+-]{1,}", normalized):
+            return len(normalized) >= 2
+        if not all("\u4e00" <= ch <= "\u9fff" for ch in normalized):
+            return False
+        if not 2 <= len(normalized) <= MAX_CHINESE_TERM_NGRAM:
+            return False
+        if normalized.endswith(("问题", "情况", "方式", "步骤", "时候")):
+            return False
+        if any(fragment in normalized for fragment in GENERIC_FRAGMENT_STOPWORDS if len(normalized) > len(fragment)):
+            return False
+        return True
+
+    def _extract_rewrite_keywords(self, query: str, *, limit: int | None = None) -> tuple[str, ...]:
+        target_limit = limit or self.settings.query_rewrite_max_keywords
+        keywords: list[str] = []
+
+        for term in self._query_anchor_terms(query):
+            lowered = term.lower()
+            if lowered not in {item.lower() for item in keywords}:
+                keywords.append(term)
+            if len(keywords) >= target_limit:
+                return tuple(keywords[:target_limit])
+
+        for term in re.findall(r"[A-Za-z][A-Za-z0-9.+-]{1,}", query):
+            if not self._is_focus_term(term):
+                continue
+            if term.lower() not in {item.lower() for item in keywords}:
+                keywords.append(term)
+            if len(keywords) >= target_limit:
+                return tuple(keywords)
+
+        candidates: list[tuple[str, int, int]] = []
+        for match in re.finditer(r"[\u4e00-\u9fff]{2,16}", query):
+            run = match.group(0)
+            max_size = min(4, MAX_CHINESE_TERM_NGRAM, len(run))
+            for size in range(max_size, 1, -1):
+                for start in range(0, len(run) - size + 1):
+                    term = run[start : start + size]
+                    if not self._is_focus_term(term):
+                        continue
+                    score = self._term_lexicon.get(term, 0)
+                    if score <= 0:
+                        continue
+                    candidates.append((term, score, query.find(term)))
+
+        for term, score, position in sorted(candidates, key=lambda item: (-item[1], -len(item[0]), item[2])):
+            lowered = term.lower()
+            if lowered in {item.lower() for item in keywords}:
+                continue
+            if any(lowered in existing.lower() or existing.lower() in lowered for existing in keywords):
+                continue
+            keywords.append(term)
+            if len(keywords) >= target_limit:
+                break
+
+        return tuple(keywords[:target_limit])
+
+    @staticmethod
+    def _is_focus_term(term: str) -> bool:
+        normalized = term.strip()
+        if not normalized or normalized.isdigit():
+            return False
+        if normalized in {"一次", "一般", "通常"}:
+            return False
+        lowered = normalized.lower()
+        if lowered in {item.lower() for item in (*GENERIC_REWRITE_STOPWORDS, *GENERIC_FRAGMENT_STOPWORDS)}:
+            return False
+        if re.fullmatch(r"[A-Za-z][A-Za-z0-9.+-]{1,}", normalized):
+            return len(normalized) >= 2
+        if not all("\u4e00" <= ch <= "\u9fff" for ch in normalized):
+            return False
+        if not 2 <= len(normalized) <= MAX_CHINESE_TERM_NGRAM:
+            return False
+        if normalized.endswith(("问题", "情况", "方式", "步骤", "时候")):
+            return False
+        if any(fragment in normalized for fragment in GENERIC_FRAGMENT_STOPWORDS if len(normalized) > len(fragment)):
+            return False
+        return True
+
+    @staticmethod
+    def _query_anchor_terms(query: str) -> tuple[str, ...]:
+        lowered = query.lower()
+        anchors: list[str] = []
+
+        def add(term: str) -> None:
+            if term.lower() not in {item.lower() for item in anchors}:
+                anchors.append(term)
+
+        if "app" in lowered:
+            add("APP")
+        if "wifi" in lowered:
+            add("WiFi")
+        if any(marker in query for marker in ("连不上", "连接不上", "无法连接", "连接失败", "连接")):
+            add("连接")
+            add("网络")
+        if any(marker in query for marker in ("绑定", "配网", "添加设备")):
+            add("绑定")
+        if any(marker in query for marker in ("路由器", "2.4G", "5G", "网络")):
+            add("路由器")
+        if any(marker in query for marker in ("回充", "回桩", "充电")):
+            add("回充")
+        if any(marker in query for marker in ("出水", "漏水")):
+            add("出水")
+        if any(marker in query for marker in ("水箱", "拖布", "堵塞")):
+            add("水箱")
+        if any(marker in query for marker in ("大户型", "大面积")):
+            add("大户型")
+        if any(marker in query for marker in ("参数", "指标")):
+            add("参数")
+        if any(marker in query for marker in ("续航", "电池")):
+            add("续航")
+        if any(marker in query for marker in ("集尘", "尘袋", "尘盒")):
+            add("集尘")
+        if any(marker in query for marker in ("导航", "避障")):
+            add("导航")
+        return tuple(anchors)
+
+    def _query_overlap_terms(self, query: str, rewrite: QueryRewrite | None = None) -> list[str]:
+        terms: list[str] = []
+
+        def add(term: str) -> None:
+            normalized = term.strip().lower()
+            if normalized and normalized not in {item.lower() for item in terms}:
+                terms.append(term)
+
+        for term in self._query_anchor_terms(query):
+            add(term)
+        if rewrite is not None:
+            for term in rewrite.keywords:
+                add(term)
+        else:
+            for term in self._extract_rewrite_keywords(query, limit=6):
+                add(term)
+
+        if terms:
+            return [term.lower() for term in terms]
+        return self._tokenize(query)
+
+    @staticmethod
+    def _topic_hint_bonus(query: str, intent: str, chunk: KnowledgeChunk, rewrite_terms: list[str]) -> float:
+        text = f"{chunk.title}\n{' '.join(chunk.heading_path)}\n{chunk.content}".lower()
+        lowered_query = query.lower()
+        bonus = 0.0
+        strong_connection_markers = ("wifi", "2.4g", "路由器", "绑定", "添加设备")
+        connection_query = "app" in lowered_query or "wifi" in lowered_query or "连接" in query or "绑定" in query
+
+        if intent == "selection":
+            if any(marker in query for marker in ("参数", "适合", "选购", "大户型")) and any(
+                marker in text for marker in ("参数", "选购", "续航", "导航", "集尘", "尘盒", "水箱", "大户型")
+            ):
+                bonus += 40.0
+        elif intent == "troubleshooting":
+            if connection_query and any(
+                marker in text for marker in ("app", "wifi", "2.4g", "路由器", "绑定", "网络", "连接")
+            ):
+                bonus += 52.0
+            if connection_query and any(marker in text for marker in strong_connection_markers):
+                bonus += 34.0
+            if "出水" in query and any(marker in text for marker in ("出水", "水箱", "水痕", "拖布", "堵塞")):
+                bonus += 48.0
+            if "出水" in query and any(marker in text for marker in ("堵塞", "不出水", "水痕", "过大", "过小", "异常")):
+                bonus += 26.0
+            if "回充" in query and any(marker in text for marker in ("回充", "充电", "充电座", "传感器")):
+                bonus += 48.0
+        elif intent == "maintenance":
+            if any(marker in query for marker in ("清理", "更换", "保养", "维护")) and any(
+                marker in text for marker in ("清理", "更换", "维护", "保养", "滤网", "滚刷", "边刷")
+            ):
+                bonus += 36.0
+            component_hits = 0
+            component_groups = (
+                (("滚刷", "主刷"), "滚刷"),
+                (("边刷",), "边刷"),
+                (("滤网",), "滤网"),
+            )
+            for aliases, requested in component_groups:
+                if requested in query and any(alias in text for alias in aliases):
+                    component_hits += 1
+            bonus += component_hits * 22.0
+
+        if rewrite_terms:
+            hits = sum(1 for term in rewrite_terms if term.lower() in text)
+            if hits >= 2:
+                bonus += 18.0
+        return bonus
+
+    @staticmethod
+    def _topic_miss_penalty(query: str, intent: str, chunk: KnowledgeChunk, rewrite_terms: list[str]) -> float:
+        text = f"{chunk.title}\n{' '.join(chunk.heading_path)}\n{chunk.content}".lower()
+        lowered_query = query.lower()
+        connection_query = "app" in lowered_query or "wifi" in lowered_query or "连接" in query or "绑定" in query
+
+        if intent == "selection" and any(marker in text for marker in ("检测：", "修复：", "故障", "报警")):
+            return -72.0
+
+        if intent == "troubleshooting":
+            if connection_query and not any(
+                marker in text for marker in ("wifi", "2.4g", "路由器", "绑定", "网络", "连接", "app")
+            ):
+                return -56.0
+            if connection_query and "app" in text and not any(marker in text for marker in ("wifi", "2.4g", "路由器", "绑定", "连接")):
+                return -26.0
+            if "出水" in query and any(marker in text for marker in ("回充", "充电座")) and "出水" not in text:
+                return -60.0
+            if "出水" in query and any(marker in text for marker in ("设置", "定时扫拖", "自动扫拖", "完成后自动回充")):
+                return -44.0
+            if "回充" in query and any(marker in text for marker in ("wifi", "路由器", "出水")) and "回充" not in text:
+                return -60.0
+        if intent == "maintenance":
+            if any(marker in query for marker in ("滚刷", "边刷", "滤网")) and not any(
+                marker in text for marker in ("滚刷", "主刷", "边刷", "滤网")
+            ):
+                return -48.0
+            if "拖布" not in query and "拖布" in text and not any(marker in text for marker in ("滚刷", "主刷", "边刷", "滤网")):
+                return -28.0
+
+        if rewrite_terms and not any(term.lower() in text for term in rewrite_terms):
+            return -18.0
+        return 0.0
+
     @staticmethod
     def _score_text_overlap(query_terms: list[str], text: str) -> float:
         if not query_terms or not text.strip():
             return 0.0
+        lowered = text.lower()
         text_tokens = Counter(KnowledgeBase._tokenize(text))
         overlap = sum(1 for term in query_terms if term in text_tokens)
+        overlap += sum(1 for term in query_terms if len(term) >= 2 and term in lowered)
         return overlap / max(len(set(query_terms)), 1)
 
     @staticmethod

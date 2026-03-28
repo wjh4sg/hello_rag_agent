@@ -1,17 +1,24 @@
 from __future__ import annotations
 
+import os
+
 import httpx
 from hello_agents import HelloAgentsLLM
 from hello_agents.core.llm_adapters import AnthropicAdapter, BaseLLMAdapter, GeminiAdapter, OpenAIAdapter
 
 
 class DirectOpenAIAdapter(OpenAIAdapter):
-    """Use a direct HTTP client so model calls ignore inherited proxy settings."""
+    """Use an explicit HTTP client while still honoring local proxy settings by default."""
+
+    @staticmethod
+    def _trust_env() -> bool:
+        raw = os.getenv("LLM_TRUST_ENV", "true").strip().lower()
+        return raw not in {"0", "false", "no", "off"}
 
     def create_client(self):
         from openai import OpenAI
 
-        http_client = httpx.Client(timeout=self.timeout, trust_env=False)
+        http_client = httpx.Client(timeout=self.timeout, trust_env=self._trust_env())
         return OpenAI(
             api_key=self.api_key,
             base_url=self.base_url,
@@ -22,7 +29,7 @@ class DirectOpenAIAdapter(OpenAIAdapter):
     def create_async_client(self):
         from openai import AsyncOpenAI
 
-        http_client = httpx.AsyncClient(timeout=self.timeout, trust_env=False)
+        http_client = httpx.AsyncClient(timeout=self.timeout, trust_env=self._trust_env())
         return AsyncOpenAI(
             api_key=self.api_key,
             base_url=self.base_url,
